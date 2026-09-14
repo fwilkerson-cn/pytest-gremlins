@@ -126,3 +126,41 @@ class DescribeVerdictFidelity:
 
         zapped, survived, _ = _verdicts(result.stdout.str())
         assert (zapped, survived) == (11, 0)
+
+
+@pytest.mark.medium
+class DescribeInstrumentedModuleAttributes:
+    """Instrumented modules keep the import-time attributes their code reads."""
+
+    def it_gives_an_instrumented_module_a_usable_dunder_file(
+        self,
+        pytester_with_markers: pytest.Pytester,
+    ) -> None:
+        pytester_with_markers.makepyfile(
+            sample="""
+            from pathlib import Path
+
+            HERE = Path(__file__).resolve().parent
+
+
+            def classify(n):
+                if n > 10:
+                    return 'big'
+                return 'small'
+            """,
+        )
+        pytester_with_markers.makepyfile(
+            test_sample="""
+            from sample import classify
+
+            def test_covers():
+                assert classify(11) == 'big'
+                assert classify(1) == 'small'
+            """,
+        )
+
+        result = pytester_with_markers.runpytest_subprocess(*_GREMLIN_ARGS)
+
+        zapped, survived, error = _verdicts(result.stdout.str())
+        assert error == 0
+        assert zapped + survived > 0

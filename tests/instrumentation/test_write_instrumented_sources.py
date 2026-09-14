@@ -17,7 +17,7 @@ def _parse_final_source(tmp_path: Path, source: str) -> list[ast.stmt]:
     original_path = str(tmp_path / 'mymod.py')
     result_dir = _write_instrumented_sources({original_path: tree}, tmp_path)
     sources = json.loads((result_dir / 'sources.json').read_text())
-    parsed: list[ast.stmt] = ast.parse(sources['mymod']).body
+    parsed: list[ast.stmt] = ast.parse(sources['mymod']['source']).body
     return parsed
 
 
@@ -101,7 +101,7 @@ class DescribeWriteInstrumentedSources:
         original_path = str(tmp_path / 'mymod.py')
         result_dir = _write_instrumented_sources({original_path: tree}, tmp_path)
         sources = json.loads((result_dir / 'sources.json').read_text())
-        assert '__gremlin_active__' in sources['mymod']
+        assert '__gremlin_active__' in sources['mymod']['source']
 
     def it_handles_empty_module_body(self, tmp_path: Path) -> None:
         body = _parse_final_source(tmp_path, '')
@@ -139,3 +139,17 @@ class DescribeWriteInstrumentedSources:
             f'All future imports must precede injection: {labels}'
         )
         assert injection_index < user_code_index, f'Injection must precede user code: {labels}'
+
+
+@pytest.mark.medium
+class DescribeInstrumentedSourceOrigin:
+    """The payload carries the path each instrumented source came from."""
+
+    def it_records_the_originating_file_path(self, tmp_path: Path) -> None:
+        original_path = tmp_path / 'mymod.py'
+        tree = ast.parse('x = 1\n')
+
+        result_dir = _write_instrumented_sources({str(original_path): tree}, tmp_path)
+        sources = json.loads((result_dir / 'sources.json').read_text())
+
+        assert sources['mymod']['origin'] == str(original_path.resolve())
