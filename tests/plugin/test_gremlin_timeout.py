@@ -77,7 +77,7 @@ class DescribeGremlinSessionTimeout:
 
         assert session.timeout == DEFAULT_GREMLIN_TIMEOUT
 
-    def it_defaults_to_a_value_that_clears_a_one_minute_suite(self) -> None:
+    def it_defaults_high_enough_to_clear_a_multi_minute_suite(self) -> None:
         assert DEFAULT_GREMLIN_TIMEOUT >= 300
 
     def it_accepts_an_explicit_timeout(self) -> None:
