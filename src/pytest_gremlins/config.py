@@ -37,6 +37,10 @@ class GremlinConfig:
         cache: Whether to enable incremental analysis cache.
         report: List of report formats (e.g. ["html", "json"]).
         batch_size: Number of gremlins per batch in batch mode.
+        timeout: Seconds one gremlin's test run may take before it is reported
+            as a timeout. A surviving gremlin runs the whole suite, because
+            stop-on-first-failure never fires, so a usable value exceeds the
+            project's full suite runtime.
     """
 
     operators: list[str] | None = None
@@ -48,6 +52,7 @@ class GremlinConfig:
     batch_size: int | None = None
     max_pardons_pct: float | None = None
     max_pardons: int | None = None
+    timeout: int | None = None
 
 
 def _resolve_workers(value: int | str | None) -> int | None:
@@ -202,6 +207,16 @@ def load_config(rootdir: Path) -> GremlinConfig:  # noqa: C901, PLR0912, PLR0915
                 f'(e.g. max-pardons-pct = 5.0), got {max_pardons_pct_raw!r}'
             )
 
+    timeout_raw = tool_config.get('timeout')
+    if timeout_raw is not None and (
+        isinstance(timeout_raw, bool) or not isinstance(timeout_raw, int) or timeout_raw <= 0
+    ):
+        logger.warning('Invalid timeout in %s: expected positive integer, got %r', pyproject_path, timeout_raw)
+        raise ValueError(
+            f'[tool.pytest-gremlins].timeout must be a positive integer number of seconds '
+            f'(e.g. timeout = 600), got {timeout_raw!r}'
+        )
+
     max_pardons_raw = tool_config.get('max_pardons')
     if max_pardons_raw is not None:
         if isinstance(max_pardons_raw, bool) or not isinstance(max_pardons_raw, int):
@@ -234,6 +249,7 @@ def load_config(rootdir: Path) -> GremlinConfig:  # noqa: C901, PLR0912, PLR0915
         batch_size=batch_size_raw,
         max_pardons_pct=max_pardons_pct_raw,
         max_pardons=max_pardons_raw,
+        timeout=timeout_raw,
     )
 
 
@@ -499,6 +515,7 @@ def merge_configs(
     cli_batch_size: int | None = None,
     cli_max_pardons_pct: float | None = None,
     cli_max_pardons: int | None = None,
+    cli_timeout: int | None = None,
 ) -> GremlinConfig:
     """Merge CLI arguments with file configuration.
 
@@ -516,6 +533,7 @@ def merge_configs(
         cli_batch_size: Batch size from CLI (--gremlin-batch-size).
         cli_max_pardons_pct: Max pardoned % from CLI (--gremlin-max-pardons-pct).
         cli_max_pardons: Max absolute pardon count from CLI (--max-pardons).
+        cli_timeout: Per-gremlin timeout in seconds from CLI (--gremlin-timeout).
 
     Returns:
         GremlinConfig with CLI values overriding file config where provided.
@@ -542,6 +560,7 @@ def merge_configs(
         cli_max_pardons_pct if cli_max_pardons_pct is not None else file_config.max_pardons_pct
     )
     max_pardons: int | None = cli_max_pardons if cli_max_pardons is not None else file_config.max_pardons
+    timeout: int | None = cli_timeout if cli_timeout is not None else file_config.timeout
 
     return GremlinConfig(
         operators=operators,
@@ -553,4 +572,5 @@ def merge_configs(
         batch_size=batch_size,
         max_pardons_pct=max_pardons_pct,
         max_pardons=max_pardons,
+        timeout=timeout,
     )

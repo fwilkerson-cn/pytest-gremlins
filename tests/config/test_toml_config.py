@@ -416,3 +416,80 @@ class DescribeMergeConfigsNewFields:
         assert merged_config.report is None
         assert merged_config.batch_size is None
         assert merged_config.max_pardons_pct is None
+
+
+@pytest.mark.small
+class DescribeGremlinConfigTimeout:
+    """GremlinConfig carries the per-mutant timeout."""
+
+    def it_defaults_timeout_to_none(self):
+        config = GremlinConfig()
+
+        assert config.timeout is None
+
+    def it_accepts_timeout_as_int(self):
+        config = GremlinConfig(timeout=600)
+
+        assert config.timeout == 600
+
+
+@pytest.mark.medium
+class DescribeLoadConfigTimeout:
+    """load_config reads and validates timeout from pyproject.toml."""
+
+    def it_reads_timeout(self, tmp_path: Path) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text('[tool.pytest-gremlins]\ntimeout = 600\n')
+
+        loaded_config = load_config(tmp_path)
+
+        assert loaded_config.timeout == 600
+
+    def it_defaults_timeout_to_none_when_absent(self, tmp_path: Path) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text('[tool.pytest-gremlins]\noperators = ["comparison"]\n')
+
+        loaded_config = load_config(tmp_path)
+
+        assert loaded_config.timeout is None
+
+    @pytest.mark.parametrize('timeout_value', ['0', '-1', '2.5', 'true', '"600"'])
+    def it_raises_on_an_unusable_timeout(self, tmp_path: Path, timeout_value: str) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text(f'[tool.pytest-gremlins]\ntimeout = {timeout_value}\n')
+
+        with pytest.raises(ValueError, match='timeout'):
+            load_config(tmp_path)
+
+    def it_names_the_offending_value_in_the_message(self, tmp_path: Path) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text('[tool.pytest-gremlins]\ntimeout = 0\n')
+
+        with pytest.raises(ValueError, match='0'):
+            load_config(tmp_path)
+
+
+@pytest.mark.small
+class DescribeMergeConfigsTimeout:
+    """CLI timeout beats TOML timeout."""
+
+    def it_prefers_cli_timeout_over_toml(self):
+        file_config = GremlinConfig(timeout=600)
+
+        merged_config = merge_configs(file_config, cli_timeout=120)
+
+        assert merged_config.timeout == 120
+
+    def it_uses_toml_timeout_when_cli_timeout_is_none(self):
+        file_config = GremlinConfig(timeout=600)
+
+        merged_config = merge_configs(file_config, cli_timeout=None)
+
+        assert merged_config.timeout == 600
+
+    def it_returns_none_when_both_are_none(self):
+        file_config = GremlinConfig()
+
+        merged_config = merge_configs(file_config)
+
+        assert merged_config.timeout is None
