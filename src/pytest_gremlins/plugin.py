@@ -1167,6 +1167,7 @@ def _write_instrumented_sources(
 
     Creates a temporary directory containing:
     1. A JSON file mapping module names to their instrumented source code
+       and the path of the file that source came from
     2. A bootstrap script that registers import hooks and runs pytest
     3. The lightweight runner script, unless ``lightweight_runner`` is False
 
@@ -1192,11 +1193,14 @@ del _gremlin_os
 
     injection_nodes = ast.parse(gremlin_active_injection).body
 
-    instrumented_sources: dict[str, str] = {}
+    instrumented_sources: dict[str, dict[str, str]] = {}
     for original_path, tree in instrumented_asts.items():
         module_name = _path_to_module_name(Path(original_path), rootdir)
         injected_body = _prepend_injection(tree.body, injection_nodes)
-        instrumented_sources[module_name] = ast.unparse(ast.Module(body=injected_body, type_ignores=tree.type_ignores))
+        instrumented_sources[module_name] = {
+            'source': ast.unparse(ast.Module(body=injected_body, type_ignores=tree.type_ignores)),
+            'origin': str(Path(original_path).resolve()),
+        }
 
     sources_file = temp_dir / 'sources.json'
     sources_file.write_text(json.dumps(instrumented_sources))
@@ -1368,10 +1372,13 @@ def main():
 
     class GremlinFinder(MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
-            if fullname in instrumented_sources:
-                loader = GremlinLoader(instrumented_sources[fullname], fullname)
-                return ModuleSpec(fullname, loader)
-            return None
+            entry = instrumented_sources.get(fullname)
+            if entry is None:
+                return None
+            loader = GremlinLoader(entry['source'], fullname)
+            spec = ModuleSpec(fullname, loader, origin=entry['origin'])
+            spec.has_location = True
+            return spec
 
     # Register finder at the START of meta_path
     sys.meta_path.insert(0, GremlinFinder())
@@ -1438,10 +1445,13 @@ def setup_import_hooks():
 
     class GremlinFinder(MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
-            if fullname in instrumented_sources:
-                loader = GremlinLoader(instrumented_sources[fullname], fullname)
-                return ModuleSpec(fullname, loader)
-            return None
+            entry = instrumented_sources.get(fullname)
+            if entry is None:
+                return None
+            loader = GremlinLoader(entry['source'], fullname)
+            spec = ModuleSpec(fullname, loader, origin=entry['origin'])
+            spec.has_location = True
+            return spec
 
     sys.meta_path.insert(0, GremlinFinder())
 
