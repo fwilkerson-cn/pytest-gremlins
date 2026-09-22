@@ -177,7 +177,7 @@ class DescribeRunMutationTestingInprocess:
 
     def it_uses_inprocess_executor_for_inprocess_choice(self) -> None:
         gremlin = _make_gremlin('g1', '/project/src/pkg/mod.py')
-        session = GremlinSession(gremlins=[gremlin])
+        session = GremlinSession(gremlins=[gremlin], timeout=450)
         mock_executor = MagicMock(spec=InProcessExecutor)
         mock_executor.execute.return_value = [
             WorkerResult(
@@ -190,7 +190,7 @@ class DescribeRunMutationTestingInprocess:
                 'inprocess', session, Path('/project/src'), ['pytest', 'tests/test_a.py::test_a']
             )
 
-        cls_mock.assert_called_once_with(timeout=30)
+        cls_mock.assert_called_once_with(timeout=450)
         assert len(results) == 1
         assert results[0].gremlin is gremlin
         assert results[0].status == GremlinResultStatus.ZAPPED
@@ -198,7 +198,7 @@ class DescribeRunMutationTestingInprocess:
 
     def it_uses_fork_executor_for_fork_choice(self) -> None:
         gremlin = _make_gremlin('g1', '/project/src/pkg/mod.py')
-        session = GremlinSession(gremlins=[gremlin], batch_size=25)
+        session = GremlinSession(gremlins=[gremlin], batch_size=25, timeout=450)
         mock_executor = MagicMock(spec=ForkExecutor)
         mock_executor.execute.return_value = [
             WorkerResult(gremlin_id='g1', status=GremlinResultStatus.SURVIVED, execution_time_ms=10.0),
@@ -209,7 +209,7 @@ class DescribeRunMutationTestingInprocess:
                 'fork', session, Path('/project/src'), ['pytest', 'tests/test_a.py::test_a']
             )
 
-        cls_mock.assert_called_once_with(batch_size=25, timeout=30)
+        cls_mock.assert_called_once_with(batch_size=25, timeout=450)
         assert len(results) == 1
         assert results[0].status == GremlinResultStatus.SURVIVED
 

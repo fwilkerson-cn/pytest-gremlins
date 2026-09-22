@@ -10,9 +10,9 @@ Configuration values are resolved in this order (highest priority first):
 1. **Command-line options** -- Flags passed to pytest (e.g., `--gremlin-targets`)
 2. **pyproject.toml** -- `[tool.pytest-gremlins]` section
 
-When the same option is specified at both levels, the CLI value wins. This applies to all ten
+When the same option is specified at both levels, the CLI value wins. This applies to all eleven
 configurable fields (operators, paths, exclude, workers, cache, report, batch_size, lightweight_runner,
-max_pardons, max-pardons-pct).
+timeout, max_pardons, max-pardons-pct).
 
 **Source path auto-discovery** is a separate mechanism that kicks in only when neither
 `--gremlin-targets` nor `[tool.pytest-gremlins] paths` is set. It tries seven strategies in
@@ -43,6 +43,7 @@ All command-line options are prefixed with `--gremlin` or `--gremlins`.
 | `--gremlin-batch` | flag | `false` | Enable batch execution mode |
 | `--gremlin-batch-size` | integer | `10` | Number of gremlins per batch |
 | `--gremlin-no-lightweight-runner` | flag | `false` | Run every mutant through pytest instead of the lightweight runner (see below) |
+| `--gremlin-timeout` | integer | `30` | Seconds one mutant's test run may take before it is reported as Timeout |
 
 ### Output Options
 
@@ -158,6 +159,16 @@ without running, and the third is either not found under its plugin's node id or
 awaited. Turn the runner off when your suite relies on those, and each mutant is judged by pytest
 itself at the cost of pytest startup per mutant.
 
+**Raise the per-mutant timeout for a slow suite:**
+
+```bash
+pytest --gremlins --gremlin-timeout=120
+```
+
+A surviving mutant runs every test selected for it, because stop-on-first-failure never fires. On a
+suite slower than the timeout every survivor is reported as Timeout instead of Survived, so set this
+above your full suite runtime.
+
 **Audit all active pardon pragmas:**
 
 ```bash
@@ -234,6 +245,10 @@ batch_size = 20
 # Default: true (use the lightweight runner)
 lightweight_runner = false
 
+# Seconds one mutant's test run may take before it is reported as Timeout
+# Default: 30
+timeout = 120
+
 # Maximum number of pardoned gremlins (absolute ceiling)
 # Default: no limit
 max_pardons = 10
@@ -255,6 +270,7 @@ max-pardons-pct = 5.0
 | `report` | string or list | `"console"` | Report format(s): `"html"`, `"json"`, `"console"`, or a list like `["html", "json"]` |
 | `batch_size` | int | `10` | Number of gremlins per batch in batch execution mode |
 | `lightweight_runner` | boolean | `true` | Set to `false` to run every mutant through pytest instead of the lightweight runner |
+| `timeout` | int | `30` | Seconds one mutant's test run may take before it is reported as Timeout |
 | `max_pardons` | int | no limit | Absolute ceiling on pardoned gremlins |
 | `max-pardons-pct` | float | no limit | Maximum percentage of pardoned gremlins (0-100) |
 

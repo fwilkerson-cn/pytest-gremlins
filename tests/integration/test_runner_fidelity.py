@@ -127,6 +127,7 @@ class DescribeRunnerOff:
 
         assert verdicts['Zapped'] == 0
         assert verdicts['Survived'] > 0
+        assert verdicts['Timeout'] == 0
         assert verdicts['Error'] == 0
 
     def it_reports_survived_for_a_test_needing_a_conftest_fixture(

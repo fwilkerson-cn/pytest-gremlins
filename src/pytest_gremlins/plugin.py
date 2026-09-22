@@ -102,6 +102,11 @@ logger = logging.getLogger(__name__)
 
 GREMLIN_SOURCES_ENV_VAR = 'PYTEST_GREMLINS_SOURCES_FILE'
 
+DEFAULT_GREMLIN_TIMEOUT = 30
+COVERAGE_PRESCAN_TIMEOUT = 120
+
+_PERCENT_CEILING = 100
+
 
 def _get_rootdir(config: pytest.Config) -> Path:
     """Return the rootdir of the pytest session as a Path.
@@ -180,6 +185,8 @@ class GremlinSession:
         parallel_workers: Number of parallel workers (None = CPU count).
         lightweight_runner: Run each gremlin's tests through the lightweight
             runner (True) or through the pytest bootstrap (False).
+        timeout: Seconds one gremlin may spend running tests before it is
+            reported as a timeout.
         batch_enabled: Whether batch execution mode is enabled.
         batch_size: Number of gremlins per batch in batch mode.
         xdist_item_ids: Test node IDs captured from the first xdist worker after
@@ -240,6 +247,7 @@ class GremlinSession:
     max_pardons: int | None = None
     no_coverage_filter: bool = False
     lightweight_runner: bool = True
+    timeout: int = DEFAULT_GREMLIN_TIMEOUT
     test_name_to_node_ids: dict[str, list[str]] = field(default_factory=dict)
     explain_gremlin_id: str | None = None
     preserved_addopts: str = ''
@@ -487,6 +495,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help='Number of parallel workers; implies --gremlin-parallel (default: CPU count)',
     )
     group.addoption(
+        '--gremlin-timeout',
+        action='store',
+        type=int,
+        default=None,
+        dest='gremlin_timeout',
+        help=(
+            f'Seconds one gremlin may spend running tests before it is reported as a timeout '
+            f'(default: {DEFAULT_GREMLIN_TIMEOUT}). A surviving gremlin runs its whole selected suite, '
+            f'so on a slow suite raise this above the full suite runtime.'
+        ),
+    )
+    group.addoption(
         '--gremlin-batch',
         action='store_true',
         default=False,
@@ -603,11 +623,13 @@ def _init_cache(
 
 def _extract_toml_fields(
     merged_config: object,
-) -> tuple[bool | None, int | str | None, list[str] | None, int | None, float | None, int | None, bool | None]:
+) -> tuple[
+    bool | None, int | str | None, list[str] | None, int | None, float | None, int | None, bool | None, int | None
+]:
     """Extract merged-config fields, guarding against test mock objects.
 
     Returns (cache, workers, report_formats, batch_size, max_pardons_pct, max_pardons,
-    lightweight_runner) from merged_config only when it is a real GremlinConfig instance;
+    lightweight_runner, timeout) from merged_config only when it is a real GremlinConfig instance;
     otherwise returns all-None so pytest_configure falls back to argparse defaults.
 
     Args:
@@ -615,10 +637,10 @@ def _extract_toml_fields(
 
     Returns:
         Tuple of (cache, workers, report, batch_size, max_pardons_pct, max_pardons,
-        lightweight_runner), each None if unset.
+        lightweight_runner, timeout), each None if unset.
     """
     if not isinstance(merged_config, GremlinConfig):
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
     return (
         merged_config.cache,
         merged_config.workers,
@@ -627,7 +649,42 @@ def _extract_toml_fields(
         merged_config.max_pardons_pct,
         merged_config.max_pardons,
         merged_config.lightweight_runner,
+        merged_config.timeout,
     )
+
+
+def _exit_if_outside(value: float | None, flag: str, requirement: str, low: float, high: float | None) -> None:
+    """Exit pytest with a usage error when a numeric CLI option is out of range.
+
+    Args:
+        value: The option's value, or None when it was not given.
+        flag: The CLI flag, for the message.
+        requirement: The range in words, for the message.
+        low: Smallest acceptable value, inclusive.
+        high: Largest acceptable value, inclusive, or None for unbounded.
+    """
+    if value is None:
+        return
+    inside = low <= value <= high if high is not None else low <= value
+    if not inside:
+        pytest.exit(f'{flag} must be {requirement}, got {value!r}.', returncode=4)
+
+
+def _exit_on_unusable_numeric_options(
+    max_pardons_pct: float | None,
+    max_pardons: int | None,
+    timeout: int | None,
+) -> None:
+    """Validate every numeric gremlin CLI option, exiting on the first unusable one.
+
+    Args:
+        max_pardons_pct: Value of --gremlin-max-pardons-pct.
+        max_pardons: Value of --max-pardons.
+        timeout: Value of --gremlin-timeout.
+    """
+    _exit_if_outside(max_pardons_pct, '--gremlin-max-pardons-pct', 'between 0 and 100', 0, _PERCENT_CEILING)
+    _exit_if_outside(max_pardons, '--max-pardons', '>= 0', 0, None)
+    _exit_if_outside(timeout, '--gremlin-timeout', 'a positive number of seconds', 1, None)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -652,18 +709,9 @@ def pytest_configure(config: pytest.Config) -> None:
     rootdir = _get_rootdir(config)
 
     cli_max_pardons_pct: float | None = getattr(config.option, 'gremlin_max_pardons_pct', None)
-    if cli_max_pardons_pct is not None and not (0 <= cli_max_pardons_pct <= 100):  # noqa: PLR2004
-        pytest.exit(
-            f'--gremlin-max-pardons-pct must be between 0 and 100, got {cli_max_pardons_pct!r}.',
-            returncode=4,
-        )
-
     cli_max_pardons: int | None = getattr(config.option, 'max_pardons', None)
-    if cli_max_pardons is not None and cli_max_pardons < 0:
-        pytest.exit(
-            f'--max-pardons must be >= 0, got {cli_max_pardons!r}.',
-            returncode=4,
-        )
+    cli_timeout: int | None = getattr(config.option, 'gremlin_timeout', None)
+    _exit_on_unusable_numeric_options(cli_max_pardons_pct, cli_max_pardons, cli_timeout)
 
     cli_report_list = _parse_cli_report_formats(config.option.gremlin_report)
 
@@ -681,6 +729,7 @@ def pytest_configure(config: pytest.Config) -> None:
         cli_max_pardons_pct=cli_max_pardons_pct,
         cli_max_pardons=cli_max_pardons,
         cli_lightweight_runner=False if getattr(config.option, 'gremlin_no_lightweight_runner', False) else None,
+        cli_timeout=cli_timeout,
     )
 
     registry = get_default_registry()
@@ -727,6 +776,7 @@ def pytest_configure(config: pytest.Config) -> None:
         toml_max_pardons_pct,
         toml_max_pardons,
         toml_lightweight_runner,
+        toml_timeout,
     ) = _extract_toml_fields(merged_config)
 
     # Cache: merge_configs already resolved CLI-beats-TOML; default False
@@ -766,6 +816,7 @@ def pytest_configure(config: pytest.Config) -> None:
             max_pardons=toml_max_pardons,
             no_coverage_filter=bool(getattr(config.option, 'gremlin_no_coverage_filter', False)),
             lightweight_runner=toml_lightweight_runner if toml_lightweight_runner is not None else True,
+            timeout=toml_timeout if toml_timeout is not None else DEFAULT_GREMLIN_TIMEOUT,
             explain_gremlin_id=getattr(config.option, 'gremlin_explain', None),
             xdist_active=xdist_active,
             xdist_workers=xdist_worker_int if xdist_active else None,
@@ -1741,6 +1792,7 @@ def _collect_coverage(gremlin_session: GremlinSession, rootdir: Path) -> None:
         name_to_node_ids=gremlin_session.test_name_to_node_ids,
         coverage_include=coverage_include or None,
         preserved_addopts=gremlin_session.preserved_addopts,
+        timeout=gremlin_session.timeout,
     )
 
     if not coverage_data:
@@ -1904,6 +1956,7 @@ def _run_tests_with_coverage(
     name_to_node_ids: dict[str, list[str]] | None = None,
     coverage_include: list[str] | None = None,
     preserved_addopts: str = '',
+    timeout: int = DEFAULT_GREMLIN_TIMEOUT,
 ) -> dict[str, dict[str, list[int]]]:
     """Run all tests with coverage collection using dynamic contexts.
 
@@ -1931,6 +1984,8 @@ def _run_tests_with_coverage(
             (see :func:`_addopts_without_cov`), passed through as ``-o addopts=<...>``
             so collection-affecting options such as ``--import-mode=importlib`` survive
             into the subprocess. Defaults to ``''`` (clear all addopts).
+        timeout: The per-gremlin timeout. The full-suite pre-scan is bounded by
+            the larger of this and ``COVERAGE_PRESCAN_TIMEOUT``.
 
     Returns:
         Dict mapping test names to their coverage data (file path -> lines).
@@ -1976,7 +2031,7 @@ def _run_tests_with_coverage(
             cmd,
             cwd=str(rootdir),
             capture_output=True,
-            timeout=120,
+            timeout=max(COVERAGE_PRESCAN_TIMEOUT, timeout),
             check=False,
         )
     except subprocess.TimeoutExpired:  # pragma: no cover
@@ -2132,7 +2187,7 @@ def _run_batch_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912
     executor = BatchExecutor(
         batch_size=batch_size,
         max_workers=gremlin_session.parallel_workers,
-        timeout=30,
+        timeout=gremlin_session.timeout,
     )
 
     worker_results = executor.execute(
@@ -2234,7 +2289,7 @@ def _run_parallel_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912, 
 
     with WorkerPool(
         max_workers=gremlin_session.parallel_workers,
-        timeout=30,
+        timeout=gremlin_session.timeout,
     ) as pool:
         # Submit all gremlins
         futures = {}
@@ -2305,8 +2360,8 @@ def _run_mutation_testing_inprocess(
     """Run mutation testing using fork or in-process executor."""
     gremlin_module_map = _build_gremlin_module_map(gremlin_session.gremlins, rootdir)
     test_specs = [arg for arg in base_test_command if '::' in arg]
-    timeout = gremlin_session.timeout if hasattr(gremlin_session, 'timeout') else 30
-    batch_size = gremlin_session.batch_size if hasattr(gremlin_session, 'batch_size') else 50
+    timeout = gremlin_session.timeout
+    batch_size = gremlin_session.batch_size
 
     gremlin_ids = [g.gremlin_id for g in gremlin_session.gremlins if not g.pardoned]
 
@@ -2563,6 +2618,7 @@ def _run_mutation_testing(
             test_command,
             rootdir,
             gremlin_session.instrumented_dir,
+            timeout=gremlin_session.timeout,
         )
         # Attach selected tests for debuggability in reports
         gremlin_result = dataclass_replace(gremlin_result, selected_tests=selected_tests)
@@ -2908,6 +2964,7 @@ def _test_gremlin(
     test_command: list[str],
     rootdir: Path,
     instrumented_dir: Path | None,
+    timeout: int = DEFAULT_GREMLIN_TIMEOUT,
 ) -> GremlinResult:
     """Test a single gremlin by running tests with the mutation active.
 
@@ -2920,6 +2977,8 @@ def _test_gremlin(
         test_command: Command to run tests.
         rootdir: Root directory of the project.
         instrumented_dir: Directory containing bootstrap infrastructure.
+        timeout: Seconds the test subprocess may run before the gremlin is
+            reported as a timeout.
 
     Returns:
         Result of testing the gremlin.
@@ -2942,7 +3001,7 @@ def _test_gremlin(
             cwd=str(rootdir),
             env=env,
             capture_output=True,
-            timeout=30,
+            timeout=timeout,
             check=False,
         )
 
