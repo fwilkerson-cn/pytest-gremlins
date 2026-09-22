@@ -106,6 +106,26 @@ class DescribeCheckCacheForGremlin:
         assert result is not None
         assert result.status == GremlinResultStatus.ZAPPED
 
+    def it_keys_the_lookup_on_the_timeout_and_runner_mode(self) -> None:
+        mock_cache = MagicMock(spec=IncrementalCache)
+        mock_cache.get_cached_result.return_value = None
+        gs = GremlinSession(
+            enabled=True,
+            cache_enabled=True,
+            cache=mock_cache,
+            source_hashes={'src/module.py': 'hash123'},
+            timeout=120,
+            lightweight_runner=False,
+        )
+        gremlin = MagicMock()  # Gremlin is a frozen dataclass; spec= misses instance fields; bare-mock: ok
+        gremlin.file_path = 'src/module.py'
+
+        _check_cache_for_gremlin(gremlin, [], gs)
+
+        run_config = mock_cache.get_cached_result.call_args.kwargs['run_config']
+        assert 'timeout=120' in run_config
+        assert 'lightweight_runner=False' in run_config
+
 
 @pytest.mark.small
 class DescribeCacheGremlinResult:
@@ -132,6 +152,7 @@ class DescribeCacheGremlinResult:
         _cache_gremlin_result(gremlin, [], result, gs)
 
         mock_cache.cache_result_deferred.assert_called_once()
+        assert mock_cache.cache_result_deferred.call_args.kwargs['run_config'] == ('timeout=30;lightweight_runner=True')
 
     def it_skips_caching_when_source_hash_missing(self) -> None:
         """cache_result_deferred is NOT called when gremlin's file has no source hash."""

@@ -254,3 +254,48 @@ class DescribeInstrumentedModuleAttributes:
         assert verdicts['Error'] == 0
         assert verdicts['Survived'] > 0
         assert verdicts['Zapped'] > 0
+
+
+_SLOW_COVERING_TEST = """
+import time
+from sample import classify
+
+def test_covers_slowly():
+    time.sleep(3)
+    assert classify(11) == 'big'
+    assert classify(1) == 'small'
+"""
+
+
+@pytest.mark.medium
+class DescribeWarmCacheAcrossConfigChanges:
+    """A cached verdict is only reused for the timeout and runner mode that produced it."""
+
+    def it_rejudges_a_timeout_when_the_timeout_is_raised(self, pytester_with_markers: pytest.Pytester) -> None:
+        pytester_with_markers.makepyfile(sample=_TARGET)
+        pytester_with_markers.makepyfile(test_sample=_SLOW_COVERING_TEST)
+        cache_args = (*_BASE_ARGS, *_RUNNER_OFF, '--gremlin-cache')
+
+        first = _verdicts(pytester_with_markers.runpytest_subprocess(*cache_args, '--gremlin-timeout=1').stdout.str())
+        second_run = pytester_with_markers.runpytest_subprocess(*cache_args, '--gremlin-timeout=120')
+        second = _verdicts(second_run.stdout.str())
+
+        assert first['Timeout'] > 0
+        assert second['Timeout'] == 0
+        assert second['Zapped'] > 0
+        assert 'cache hit' not in second_run.stdout.str()
+
+    def it_rejudges_a_fabricated_kill_when_the_runner_is_turned_off(
+        self,
+        pytester_with_markers: pytest.Pytester,
+    ) -> None:
+        pytester_with_markers.makepyfile(sample=_TARGET)
+        pytester_with_markers.makepyfile(test_sample=_SAYS_NOTHING['fixture'])
+        cache_args = (*_BASE_ARGS, '--gremlin-cache')
+
+        first = _verdicts(pytester_with_markers.runpytest_subprocess(*cache_args).stdout.str())
+        second = _verdicts(pytester_with_markers.runpytest_subprocess(*cache_args, *_RUNNER_OFF).stdout.str())
+
+        assert first['Zapped'] > 0
+        assert second['Zapped'] == 0
+        assert second['Survived'] > 0
