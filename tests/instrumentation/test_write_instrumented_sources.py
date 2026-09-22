@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
-from pytest_gremlins.plugin import _write_instrumented_sources
+from pytest_gremlins.plugin import (
+    _get_lightweight_runner_script,
+    _write_instrumented_sources,
+)
 
 
 def _parse_final_source(tmp_path: Path, source: str) -> list[ast.stmt]:
@@ -139,3 +146,25 @@ class DescribeWriteInstrumentedSources:
             f'All future imports must precede injection: {labels}'
         )
         assert injection_index < user_code_index, f'Injection must precede user code: {labels}'
+
+
+@pytest.mark.medium
+class DescribeLightweightRunnerEncoding:
+    """The runner file is UTF-8 whatever the interpreter's locale encoding is."""
+
+    def it_writes_the_runner_as_utf8_under_an_ascii_locale(self, tmp_path: Path) -> None:
+        script = textwrap.dedent(
+            f"""
+            import ast, sys
+            from pytest_gremlins.plugin import _write_instrumented_sources
+            asts = {{{str(tmp_path / 'mymod.py')!r}: ast.parse('x = 1')}}
+            sys.stdout.write(str(_write_instrumented_sources(asts, {str(tmp_path)!r})))
+            """
+        )
+        env = {**os.environ, 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0', 'LC_ALL': 'C', 'LANG': 'C'}
+
+        completed = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True, check=False)
+
+        assert completed.returncode == 0, completed.stderr
+        runner = Path(completed.stdout.strip()) / 'gremlin_lightweight_runner.py'
+        assert runner.read_bytes().decode('utf-8') == _get_lightweight_runner_script()
