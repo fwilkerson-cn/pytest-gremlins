@@ -167,7 +167,7 @@ class DescribeLightweightRunnerEncoding:
 
         assert completed.returncode == 0, completed.stderr
         runner = Path(completed.stdout.strip()) / 'gremlin_lightweight_runner.py'
-        assert runner.read_bytes().decode('utf-8') == _get_lightweight_runner_script()
+        assert runner.read_text(encoding='utf-8') == _get_lightweight_runner_script()
 
 
 @pytest.mark.medium

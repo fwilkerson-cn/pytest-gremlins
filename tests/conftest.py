@@ -150,7 +150,7 @@ def make_pytest_config() -> Callable[..., Any]:
 
 
 @pytest.fixture
-def pytester_with_markers(pytester: pytest.Pytester) -> pytest.Pytester:
+def pytester_with_markers(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> pytest.Pytester:
     """Create a pytester instance that auto-applies small marker to tests.
 
     The pytest-test-categories plugin requires tests to have size markers.
@@ -160,6 +160,7 @@ def pytester_with_markers(pytester: pytest.Pytester) -> pytest.Pytester:
     This fixture creates a conftest.py that registers the small marker and
     auto-applies it to any test that doesn't already have a size marker.
     """
+    monkeypatch.setenv('PYTHONIOENCODING', 'utf-8')
     pytester.makeconftest(
         """
 import pytest
