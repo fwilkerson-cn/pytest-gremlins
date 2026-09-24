@@ -37,6 +37,8 @@ class GremlinConfig:
         cache: Whether to enable incremental analysis cache.
         report: List of report formats (e.g. ["html", "json"]).
         batch_size: Number of gremlins per batch in batch mode.
+        lightweight_runner: Whether each mutant's tests run through the lightweight
+            runner (True) or through pytest itself (False).
     """
 
     operators: list[str] | None = None
@@ -46,6 +48,7 @@ class GremlinConfig:
     cache: bool | None = None
     report: list[str] | None = None
     batch_size: int | None = None
+    lightweight_runner: bool | None = None
     max_pardons_pct: float | None = None
     max_pardons: int | None = None
 
@@ -142,6 +145,16 @@ def load_config(rootdir: Path) -> GremlinConfig:  # noqa: C901, PLR0912, PLR0915
         logger.warning('Invalid cache in %s: expected boolean, got %r', pyproject_path, cache_raw)
         raise ValueError(f'[tool.pytest-gremlins].cache must be a boolean (e.g. cache = true), got {cache_raw!r}')
 
+    lightweight_runner_raw = tool_config.get('lightweight_runner')
+    if lightweight_runner_raw is not None and not isinstance(lightweight_runner_raw, bool):
+        logger.warning(
+            'Invalid lightweight_runner in %s: expected boolean, got %r', pyproject_path, lightweight_runner_raw
+        )
+        raise ValueError(
+            f'[tool.pytest-gremlins].lightweight_runner must be a boolean (e.g. lightweight_runner = false), '
+            f'got {lightweight_runner_raw!r}'
+        )
+
     report_raw = tool_config.get('report')
     if report_raw is not None:
         if isinstance(report_raw, str):
@@ -234,6 +247,7 @@ def load_config(rootdir: Path) -> GremlinConfig:  # noqa: C901, PLR0912, PLR0915
         batch_size=batch_size_raw,
         max_pardons_pct=max_pardons_pct_raw,
         max_pardons=max_pardons_raw,
+        lightweight_runner=lightweight_runner_raw,
     )
 
 
@@ -499,6 +513,7 @@ def merge_configs(
     cli_batch_size: int | None = None,
     cli_max_pardons_pct: float | None = None,
     cli_max_pardons: int | None = None,
+    cli_lightweight_runner: bool | None = None,
 ) -> GremlinConfig:
     """Merge CLI arguments with file configuration.
 
@@ -516,6 +531,7 @@ def merge_configs(
         cli_batch_size: Batch size from CLI (--gremlin-batch-size).
         cli_max_pardons_pct: Max pardoned % from CLI (--gremlin-max-pardons-pct).
         cli_max_pardons: Max absolute pardon count from CLI (--max-pardons).
+        cli_lightweight_runner: False when --gremlin-no-lightweight-runner was given, else None.
 
     Returns:
         GremlinConfig with CLI values overriding file config where provided.
@@ -542,6 +558,9 @@ def merge_configs(
         cli_max_pardons_pct if cli_max_pardons_pct is not None else file_config.max_pardons_pct
     )
     max_pardons: int | None = cli_max_pardons if cli_max_pardons is not None else file_config.max_pardons
+    lightweight_runner: bool | None = (
+        cli_lightweight_runner if cli_lightweight_runner is not None else file_config.lightweight_runner
+    )
 
     return GremlinConfig(
         operators=operators,
@@ -553,4 +572,5 @@ def merge_configs(
         batch_size=batch_size,
         max_pardons_pct=max_pardons_pct,
         max_pardons=max_pardons,
+        lightweight_runner=lightweight_runner,
     )

@@ -78,6 +78,7 @@
     "hotfixes",
     "htmlcov",
     "husky",
+    "inprocess",
     "instrumentation",
     "instrumentations",
     "instrumenting",

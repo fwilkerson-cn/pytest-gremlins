@@ -139,3 +139,23 @@ class DescribeWriteInstrumentedSources:
             f'All future imports must precede injection: {labels}'
         )
         assert injection_index < user_code_index, f'Injection must precede user code: {labels}'
+
+
+@pytest.mark.medium
+class DescribeLightweightRunnerOptOut:
+    """The runner file is the switch every call site reads: absent means run through pytest."""
+
+    def it_writes_the_runner_by_default(self, tmp_path: Path) -> None:
+        result_dir = _write_instrumented_sources({str(tmp_path / 'mymod.py'): ast.parse('x = 1')}, tmp_path)
+
+        assert (result_dir / 'gremlin_lightweight_runner.py').exists()
+
+    def it_omits_the_runner_when_turned_off(self, tmp_path: Path) -> None:
+        result_dir = _write_instrumented_sources(
+            {str(tmp_path / 'mymod.py'): ast.parse('x = 1')},
+            tmp_path,
+            lightweight_runner=False,
+        )
+
+        assert not (result_dir / 'gremlin_lightweight_runner.py').exists()
+        assert (result_dir / 'gremlin_bootstrap.py').exists()

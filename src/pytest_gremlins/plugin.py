@@ -178,6 +178,8 @@ class GremlinSession:
         cache_misses: Number of cache misses in this session.
         parallel_enabled: Whether parallel execution is enabled.
         parallel_workers: Number of parallel workers (None = CPU count).
+        lightweight_runner: Run each gremlin's tests through the lightweight
+            runner (True) or through the pytest bootstrap (False).
         batch_enabled: Whether batch execution mode is enabled.
         batch_size: Number of gremlins per batch in batch mode.
         xdist_item_ids: Test node IDs captured from the first xdist worker after
@@ -237,6 +239,7 @@ class GremlinSession:
     max_pardons_pct: float | None = None
     max_pardons: int | None = None
     no_coverage_filter: bool = False
+    lightweight_runner: bool = True
     test_name_to_node_ids: dict[str, list[str]] = field(default_factory=dict)
     explain_gremlin_id: str | None = None
     preserved_addopts: str = ''
@@ -550,6 +553,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help='Disable coverage-guided test selection (slow but useful for debugging).',
     )
     group.addoption(
+        '--gremlin-no-lightweight-runner',
+        action='store_true',
+        default=False,
+        dest='gremlin_no_lightweight_runner',
+        help=(
+            'Run every mutant through pytest instead of the lightweight runner. Slower per mutant, '
+            'but tests that take fixtures, are parametrized, or are async are judged by pytest itself.'
+        ),
+    )
+    group.addoption(
         '--gremlin-explain',
         action='store',
         default=None,
@@ -590,22 +603,22 @@ def _init_cache(
 
 def _extract_toml_fields(
     merged_config: object,
-) -> tuple[bool | None, int | str | None, list[str] | None, int | None, float | None, int | None]:
+) -> tuple[bool | None, int | str | None, list[str] | None, int | None, float | None, int | None, bool | None]:
     """Extract merged-config fields, guarding against test mock objects.
 
-    Returns (cache, workers, report_formats, batch_size, max_pardons_pct, max_pardons) from
-    merged_config only when it is a real GremlinConfig instance; otherwise returns
-    all-None so pytest_configure falls back to argparse defaults.
+    Returns (cache, workers, report_formats, batch_size, max_pardons_pct, max_pardons,
+    lightweight_runner) from merged_config only when it is a real GremlinConfig instance;
+    otherwise returns all-None so pytest_configure falls back to argparse defaults.
 
     Args:
         merged_config: The result of merge_configs (GremlinConfig or a test mock).
 
     Returns:
-        Tuple of (cache, workers, report, batch_size, max_pardons_pct, max_pardons),
-        each None if unset.
+        Tuple of (cache, workers, report, batch_size, max_pardons_pct, max_pardons,
+        lightweight_runner), each None if unset.
     """
     if not isinstance(merged_config, GremlinConfig):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
     return (
         merged_config.cache,
         merged_config.workers,
@@ -613,7 +626,30 @@ def _extract_toml_fields(
         merged_config.batch_size,
         merged_config.max_pardons_pct,
         merged_config.max_pardons,
+        merged_config.lightweight_runner,
     )
+
+
+def _reject_direct_call_executor_without_runner(executor: str, lightweight_runner: bool) -> None:
+    """Refuse to run the fork or inprocess executor when the lightweight runner is off.
+
+    Both executors call each test function directly, as the lightweight runner
+    does, so turning the runner off would not reach them.
+
+    Args:
+        executor: The ``--gremlin-executor`` choice.
+        lightweight_runner: The merged lightweight runner setting.
+
+    Raises:
+        SystemExit: Via ``pytest.exit`` when the two cannot be honoured together.
+    """
+    if not lightweight_runner and executor in ('fork', 'inprocess'):
+        pytest.exit(
+            f'--gremlin-executor={executor} calls test functions directly, so it cannot honour '
+            'lightweight_runner = false or --gremlin-no-lightweight-runner. '
+            'Use --gremlin-executor=subprocess or auto.',
+            returncode=4,
+        )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -666,6 +702,7 @@ def pytest_configure(config: pytest.Config) -> None:
         cli_batch_size=config.option.gremlin_batch_size,
         cli_max_pardons_pct=cli_max_pardons_pct,
         cli_max_pardons=cli_max_pardons,
+        cli_lightweight_runner=False if getattr(config.option, 'gremlin_no_lightweight_runner', False) else None,
     )
 
     registry = get_default_registry()
@@ -711,7 +748,11 @@ def pytest_configure(config: pytest.Config) -> None:
         toml_batch_size,
         toml_max_pardons_pct,
         toml_max_pardons,
+        toml_lightweight_runner,
     ) = _extract_toml_fields(merged_config)
+
+    lightweight_runner: bool = toml_lightweight_runner if toml_lightweight_runner is not None else True
+    _reject_direct_call_executor_without_runner(getattr(config.option, 'gremlin_executor', 'auto'), lightweight_runner)
 
     # Cache: merge_configs already resolved CLI-beats-TOML; default False
     cache_enabled: bool = bool(toml_cache)
@@ -749,6 +790,7 @@ def pytest_configure(config: pytest.Config) -> None:
             max_pardons_pct=toml_max_pardons_pct,
             max_pardons=toml_max_pardons,
             no_coverage_filter=bool(getattr(config.option, 'gremlin_no_coverage_filter', False)),
+            lightweight_runner=lightweight_runner,
             explain_gremlin_id=getattr(config.option, 'gremlin_explain', None),
             xdist_active=xdist_active,
             xdist_workers=xdist_worker_int if xdist_active else None,
@@ -968,7 +1010,11 @@ def _generate_gremlins(
     gremlin_session.gremlins = all_gremlins
 
     if all_gremlins:
-        instrumented_dir = _write_instrumented_sources(instrumented_asts, rootdir)
+        instrumented_dir = _write_instrumented_sources(
+            instrumented_asts,
+            rootdir,
+            lightweight_runner=gremlin_session.lightweight_runner,
+        )
         gremlin_session.instrumented_dir = instrumented_dir
 
 
@@ -1139,12 +1185,15 @@ def _add_source_file(path: Path, source_files: dict[str, str]) -> None:
 def _write_instrumented_sources(
     instrumented_asts: dict[str, ast.Module],
     rootdir: Path,
+    *,
+    lightweight_runner: bool = True,
 ) -> Path:
     """Write instrumented sources to a JSON file for import hook injection.
 
     Creates a temporary directory containing:
     1. A JSON file mapping module names to their instrumented source code
     2. A bootstrap script that registers import hooks and runs pytest
+    3. The lightweight runner script, unless ``lightweight_runner`` is False
 
     This approach ensures that import hooks are registered BEFORE any modules
     are imported, which is necessary because pytest adds the test directory
@@ -1153,6 +1202,8 @@ def _write_instrumented_sources(
     Args:
         instrumented_asts: Mapping of original file paths to their instrumented ASTs.
         rootdir: Root directory of the project.
+        lightweight_runner: Write the lightweight runner script. When False the
+            script is absent and every mutant runs through the pytest bootstrap.
 
     Returns:
         Path to the temporary directory containing the bootstrap infrastructure.
@@ -1178,8 +1229,9 @@ del _gremlin_os
     bootstrap_script = temp_dir / 'gremlin_bootstrap.py'
     bootstrap_script.write_text(_get_bootstrap_script())
 
-    lightweight_runner = temp_dir / 'gremlin_lightweight_runner.py'
-    lightweight_runner.write_text(_get_lightweight_runner_script())
+    if lightweight_runner:
+        runner_script = temp_dir / 'gremlin_lightweight_runner.py'
+        runner_script.write_text(_get_lightweight_runner_script())
 
     return temp_dir
 

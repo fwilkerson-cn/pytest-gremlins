@@ -10,9 +10,9 @@ Configuration values are resolved in this order (highest priority first):
 1. **Command-line options** -- Flags passed to pytest (e.g., `--gremlin-targets`)
 2. **pyproject.toml** -- `[tool.pytest-gremlins]` section
 
-When the same option is specified at both levels, the CLI value wins. This applies to all nine
-configurable fields (operators, paths, exclude, workers, cache, report, batch_size, max_pardons,
-max-pardons-pct).
+When the same option is specified at both levels, the CLI value wins. This applies to all ten
+configurable fields (operators, paths, exclude, workers, cache, report, batch_size, lightweight_runner,
+max_pardons, max-pardons-pct).
 
 **Source path auto-discovery** is a separate mechanism that kicks in only when neither
 `--gremlin-targets` nor `[tool.pytest-gremlins] paths` is set. It tries seven strategies in
@@ -42,6 +42,7 @@ All command-line options are prefixed with `--gremlin` or `--gremlins`.
 | `--gremlin-workers` | integer | CPU count | Number of parallel workers (implies `--gremlin-parallel`) |
 | `--gremlin-batch` | flag | `false` | Enable batch execution mode |
 | `--gremlin-batch-size` | integer | `10` | Number of gremlins per batch |
+| `--gremlin-no-lightweight-runner` | flag | `false` | Run every mutant through pytest instead of the lightweight runner (see below) |
 
 ### Output Options
 
@@ -144,6 +145,21 @@ pytest --gremlins --gremlin-workers=4
 pytest --gremlins --gremlin-batch --gremlin-batch-size=20
 ```
 
+**Run every mutant through pytest:**
+
+```bash
+pytest --gremlins --gremlin-no-lightweight-runner
+```
+
+By default each mutant's selected tests run through a lightweight runner that imports the test
+module and calls each test function directly, skipping pytest startup. That runner cannot execute
+a test that takes a fixture, is parametrized, or is `async def`: the first two are scored as kills
+without running, and the third is either not found under its plugin's node id or called and never
+awaited. Turn the runner off when your suite relies on those, and each mutant is judged by pytest
+itself at the cost of pytest startup per mutant.
+The `fork` and `inprocess` executors call test functions directly as well, so turning the runner
+off requires `--gremlin-executor=subprocess` or `auto`; the other two are rejected at startup.
+
 **Audit all active pardon pragmas:**
 
 ```bash
@@ -216,6 +232,10 @@ report = ["html", "json"]
 # Default: 10
 batch_size = 20
 
+# Run every mutant through pytest instead of the lightweight runner
+# Default: true (use the lightweight runner)
+lightweight_runner = false
+
 # Maximum number of pardoned gremlins (absolute ceiling)
 # Default: no limit
 max_pardons = 10
@@ -236,6 +256,7 @@ max-pardons-pct = 5.0
 | `cache` | boolean | `false` | Enable incremental analysis cache |
 | `report` | string or list | `"console"` | Report format(s): `"html"`, `"json"`, `"console"`, or a list like `["html", "json"]` |
 | `batch_size` | int | `10` | Number of gremlins per batch in batch execution mode |
+| `lightweight_runner` | boolean | `true` | Set to `false` to run every mutant through pytest instead of the lightweight runner |
 | `max_pardons` | int | no limit | Absolute ceiling on pardoned gremlins |
 | `max-pardons-pct` | float | no limit | Maximum percentage of pardoned gremlins (0-100) |
 

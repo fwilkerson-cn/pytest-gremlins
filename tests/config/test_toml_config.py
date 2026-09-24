@@ -9,6 +9,7 @@ import pytest
 
 if TYPE_CHECKING:
     from pathlib import Path
+import re
 
 from pytest_gremlins.config import (
     GremlinConfig,
@@ -416,3 +417,74 @@ class DescribeMergeConfigsNewFields:
         assert merged_config.report is None
         assert merged_config.batch_size is None
         assert merged_config.max_pardons_pct is None
+
+
+@pytest.mark.small
+class DescribeGremlinConfigLightweightRunner:
+    """GremlinConfig carries the lightweight runner switch."""
+
+    def it_defaults_lightweight_runner_to_none(self):
+        config = GremlinConfig()
+
+        assert config.lightweight_runner is None
+
+    def it_accepts_lightweight_runner_as_bool(self):
+        config = GremlinConfig(lightweight_runner=False)
+
+        assert config.lightweight_runner is False
+
+
+@pytest.mark.medium
+class DescribeLoadConfigLightweightRunner:
+    """load_config reads and validates lightweight_runner from pyproject.toml."""
+
+    @pytest.mark.parametrize(('toml_value', 'expected'), [('true', True), ('false', False)])
+    def it_reads_lightweight_runner(self, tmp_path: Path, toml_value: str, expected: bool) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text(f'[tool.pytest-gremlins]\nlightweight_runner = {toml_value}\n')
+
+        loaded_config = load_config(tmp_path)
+
+        assert loaded_config.lightweight_runner is expected
+
+    def it_defaults_lightweight_runner_to_none_when_absent(self, tmp_path: Path) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text('[tool.pytest-gremlins]\noperators = ["comparison"]\n')
+
+        loaded_config = load_config(tmp_path)
+
+        assert loaded_config.lightweight_runner is None
+
+    @pytest.mark.parametrize('toml_value', ['0', '"no"', '1.5'])
+    def it_rejects_a_non_boolean_naming_the_key_and_value(self, tmp_path: Path, toml_value: str) -> None:
+        pyproject = tmp_path / 'pyproject.toml'
+        pyproject.write_text(f'[tool.pytest-gremlins]\nlightweight_runner = {toml_value}\n')
+
+        with pytest.raises(ValueError, match=rf'lightweight_runner.*{re.escape(toml_value.strip(chr(34)))}'):
+            load_config(tmp_path)
+
+
+@pytest.mark.small
+class DescribeMergeConfigsLightweightRunner:
+    """CLI lightweight_runner beats TOML lightweight_runner."""
+
+    def it_prefers_cli_over_toml(self):
+        file_config = GremlinConfig(lightweight_runner=True)
+
+        merged_config = merge_configs(file_config, cli_lightweight_runner=False)
+
+        assert merged_config.lightweight_runner is False
+
+    def it_uses_toml_when_cli_is_none(self):
+        file_config = GremlinConfig(lightweight_runner=False)
+
+        merged_config = merge_configs(file_config, cli_lightweight_runner=None)
+
+        assert merged_config.lightweight_runner is False
+
+    def it_returns_none_when_both_are_none(self):
+        file_config = GremlinConfig()
+
+        merged_config = merge_configs(file_config)
+
+        assert merged_config.lightweight_runner is None
