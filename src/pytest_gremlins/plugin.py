@@ -2633,6 +2633,21 @@ def _build_test_hashes_for_gremlin(
     return test_hashes
 
 
+def _cache_run_config(gremlin_session: GremlinSession) -> str:
+    """Name the run settings that decide a verdict independently of file content.
+
+    A verdict cached under one runner mode says nothing about the other, so
+    the runner mode is part of the cache key.
+
+    Args:
+        gremlin_session: The current gremlin session.
+
+    Returns:
+        A stable string naming the runner mode.
+    """
+    return f'lightweight_runner={gremlin_session.lightweight_runner}'
+
+
 def _check_cache_for_gremlin(
     gremlin: Gremlin,
     selected_tests: Sequence[str],
@@ -2661,6 +2676,7 @@ def _check_cache_for_gremlin(
         gremlin_id=gremlin.gremlin_id,
         source_hash=source_hash,
         test_hashes=test_hashes,
+        run_config=_cache_run_config(gremlin_session),
     )
 
     if cached is None:
@@ -2710,6 +2726,7 @@ def _cache_gremlin_result(
             execution_time_ms=result.execution_time_ms,
             error_output=result.error_output,
         ),
+        run_config=_cache_run_config(gremlin_session),
     )
 
 

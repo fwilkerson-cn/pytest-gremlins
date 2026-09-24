@@ -225,3 +225,21 @@ class DescribeRunnerOn:
 
         assert verdicts['Survived'] == 0
         assert verdicts['Zapped'] > 0
+
+
+@pytest.mark.medium
+class DescribeWarmCacheAcrossRunnerModes:
+    """A cached verdict is only reused for the runner mode that produced it."""
+
+    def it_rejudges_a_fabricated_kill_when_the_runner_is_turned_off(
+        self,
+        pytester_with_markers: pytest.Pytester,
+    ) -> None:
+        cache_args = ('--gremlin-cache',)
+
+        first = _run(pytester_with_markers, _SAYS_NOTHING['fixture'], *cache_args)
+        second = _run(pytester_with_markers, _SAYS_NOTHING['fixture'], *cache_args, *_RUNNER_OFF)
+
+        assert first['Zapped'] > 0
+        assert second['Zapped'] == 0
+        assert second['Survived'] > 0

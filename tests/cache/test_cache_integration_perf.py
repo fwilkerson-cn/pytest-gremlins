@@ -191,6 +191,23 @@ class DescribeCacheKeyEfficiency:
 class DescribeBatchOperations:
     """Tests for batch cache operations."""
 
+    def it_distinguishes_run_configs_by_cache_key(self, tmp_path: Path) -> None:
+        with IncrementalCache(tmp_path / 'cache') as cache:
+            tests = {'t1': 'h1'}
+            key_on = cache._build_cache_key('g1', 'src', tests, run_config='lightweight_runner=True')
+            key_off = cache._build_cache_key('g1', 'src', tests, run_config='lightweight_runner=False')
+
+        assert key_on != key_off
+
+    def it_misses_a_result_cached_under_another_run_config(self, tmp_path: Path) -> None:
+        with IncrementalCache(tmp_path / 'cache') as cache:
+            cache.cache_result('g1', 'src', {'t1': 'h1'}, {'status': 'zapped'}, run_config='lightweight_runner=True')
+
+            assert cache.get_cached_result('g1', 'src', {'t1': 'h1'}, run_config='lightweight_runner=True') == {
+                'status': 'zapped'
+            }
+            assert cache.get_cached_result('g1', 'src', {'t1': 'h1'}, run_config='lightweight_runner=False') is None
+
     def it_looks_up_cache_in_batches(self, tmp_path: Path) -> None:
         """Batch lookups are efficient for high cache hit scenarios."""
         cache_dir = tmp_path / '.gremlins_cache'
