@@ -1179,7 +1179,7 @@ del _gremlin_os
     bootstrap_script.write_text(_get_bootstrap_script())
 
     lightweight_runner = temp_dir / 'gremlin_lightweight_runner.py'
-    lightweight_runner.write_text(_get_lightweight_runner_script())
+    lightweight_runner.write_text(_get_lightweight_runner_script(), encoding='utf-8')
 
     return temp_dir
 
