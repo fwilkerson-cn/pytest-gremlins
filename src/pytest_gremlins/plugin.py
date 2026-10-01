@@ -39,6 +39,7 @@ from typing import (
 import warnings
 
 import coverage
+from coverage.exceptions import CoverageException
 import pytest
 
 from pytest_gremlins.cache.hasher import ContentHasher
@@ -839,6 +840,27 @@ if _XDIST_AVAILABLE:
         logger.debug('pytest_configure_node: injected gremlins_tmpdir=%s', gremlin_session.gremlins_tmpdir)
 
 
+def _is_running_on_sysmon(cov: coverage.Coverage) -> bool:
+    """Report whether ``cov`` measures with coverage's sysmon core.
+
+    sysmon ignores contexts set through ``switch_context`` (and warns about it
+    since coverage 7.15.3), so attaching ``GremlinContextPlugin`` would be useless
+    and, under ``filterwarnings = error``, fatal. Uses the public ``sys_info()``,
+    which reports the core of a started instance.
+
+    Args:
+        cov: The coverage instance pytest-cov is measuring with.
+
+    Returns:
+        True only when the core is positively identified as sysmon; a failed probe
+        returns False so the context plugin is still attached.
+    """
+    try:
+        return dict(cov.sys_info()).get('core') == 'SysMonitor'
+    except (TypeError, ValueError, CoverageException):
+        return False
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
     """At session start, register GremlinContextPlugin for coverage context tracking.
 
@@ -863,10 +885,14 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         if cov_plugin is None or cov_plugin.cov_controller is None:
             return
         cov_instance = cov_plugin.cov_controller.cov
+        if _is_running_on_sysmon(cov_instance):
+            logger.debug('pytest-cov coverage runs on sysmon; skipping per-test context switching')
+            return
         context_plugin = GremlinContextPlugin(cov_instance)
         session.config.pluginmanager.register(context_plugin)
     else:
         private_cov = coverage.Coverage(data_suffix=True)
+        private_cov.set_option('run:core', 'ctrace')
         gremlin_session.private_coverage = private_cov
         context_plugin = GremlinContextPlugin(private_cov)
         session.config.pluginmanager.register(context_plugin)
@@ -1909,6 +1935,13 @@ def _addopts_without_cov(raw_addopts: list[str]) -> str:
     return ' '.join(shlex.quote(token) for token in kept)
 
 
+# sysmon (the default core on Python 3.14+) silently drops contexts set through
+# Coverage.switch_context, crediting each line only to the first test that ran it.
+# ctrace supports them; the rc route degrades to pytrace if CTracer is unavailable.
+_COVERAGE_CORE_RC_LINE = 'core = ctrace'
+_PRESCAN_OVERRIDING_ENV_VARS = frozenset({'COVERAGE_CORE', 'COVERAGE_FILE'})
+
+
 def _run_tests_with_coverage(
     test_node_ids: list[str],
     rootdir: Path,
@@ -1959,10 +1992,10 @@ def _run_tests_with_coverage(
     has_glob_special_chars = any(ch in p for p in (coverage_include or []) for ch in '*?[]')
     if coverage_include and not has_glob_special_chars:
         include_lines = '\n'.join(f'    {path}' for path in coverage_include)
-        coveragerc_content = f'[run]\ninclude =\n{include_lines}\n'
+        coveragerc_content = f'[run]\n{_COVERAGE_CORE_RC_LINE}\ninclude =\n{include_lines}\n'
     else:
-        coveragerc_content = '[run]\nsource = .\n'
-    coveragerc_path.write_text(coveragerc_content)
+        coveragerc_content = f'[run]\n{_COVERAGE_CORE_RC_LINE}\nsource = .\n'
+    coveragerc_path.write_text(coveragerc_content, encoding='utf-8')
 
     cmd = [
         sys.executable,
@@ -1983,6 +2016,10 @@ def _run_tests_with_coverage(
         '-q',
     ]
 
+    # COVERAGE_CORE overrides the rc file (a user-set sysmon would drop contexts) and
+    # COVERAGE_FILE redirects the data file away from rootdir/.coverage, which is read below.
+    subprocess_env = {key: value for key, value in os.environ.items() if key not in _PRESCAN_OVERRIDING_ENV_VARS}
+
     try:
         subprocess.run(  # Intentional: runs pytest test commands
             cmd,
@@ -1990,6 +2027,7 @@ def _run_tests_with_coverage(
             capture_output=True,
             timeout=120,
             check=False,
+            env=subprocess_env,
         )
     except subprocess.TimeoutExpired:  # pragma: no cover
         coveragerc_path.unlink(missing_ok=True)
