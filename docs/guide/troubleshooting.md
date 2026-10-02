@@ -238,6 +238,58 @@ tomllib.TOMLDecodeError: Expected '=' after a key in a key/value pair (at line X
 
 ## Runtime Errors
 
+### Mutation testing skipped because the baseline run did not pass
+
+**Symptom:** pytest-gremlins prints one line on stderr and no mutation report, and pytest exits with
+its own non-zero status. The line names the reason:
+
+```text
+pytest-gremlins: skipping mutation testing because 2 baseline test(s) failed; mutation scores need a passing suite
+pytest-gremlins: skipping mutation testing because test collection failed (1 error(s)); fix the collection errors first
+pytest-gremlins: skipping mutation testing because the baseline test session was interrupted; rerun it to completion first
+pytest-gremlins: skipping mutation testing because pytest reported a usage error (exit 4)
+pytest-gremlins: skipping mutation testing because no tests were collected
+pytest-gremlins: skipping mutation testing because the baseline run ended with exit code 3
+pytest-gremlins: skipping mutation testing because the baseline test session was stopped early (pytest.exit)
+```
+
+**Cause:** Mutation testing needs every baseline test to pass. A gremlin is zapped when a test that
+covers it fails, so a test that already fails without any mutation would be counted as a kill for every
+gremlin it covers, and tests that never ran back no verdict at all. Any baseline in which a test failed
+(in setup, call or teardown), a module could not be collected (including with
+`--continue-on-collection-errors`), the session was interrupted, pytest reported a usage error such as an
+unknown node id, no tests were collected, or `pytest.exit(...)` stopped the run (with any return code,
+including 0) therefore skips the whole mutation run, with or without pytest-xdist. pytest-gremlins keeps
+pytest's own exit status. With `--collect-only` it prints its own `--collect-only detected` notice instead.
+
+Failing non-test checks do not block mutation testing. If every test passed but pytest still exited 1
+(for example `--cov-fail-under` was not met), pytest-gremlins prints one note and continues:
+
+```text
+pytest-gremlins: baseline tests all passed; the non-zero exit came from a non-test check (e.g. --cov-fail-under), so mutation testing continues
+```
+
+**Solution:**
+
+1. Run pytest without `--gremlins` and fix every failure and error it reports until all tests collect
+   and pass:
+
+   ```bash
+   pytest
+   ```
+
+2. If test modules cannot import your package, make it importable from the tests, for example with
+   an editable install (`pip install -e .`) or pytest's `pythonpath` setting:
+
+   ```toml
+   [tool.pytest.ini_options]
+   pythonpath = ["src"]
+   ```
+
+3. Rerun with `--gremlins` once the plain run passes.
+
+---
+
 ### Error: SyntaxError during instrumentation
 
 **Symptom:**

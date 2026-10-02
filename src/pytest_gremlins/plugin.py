@@ -258,6 +258,9 @@ class GremlinSession:
     explain_gremlin_id: str | None = None
     preserved_addopts: str = ''
     coverage_timeout: int = DEFAULT_COVERAGE_TIMEOUT_SECONDS
+    collection_errors: int = 0
+    baseline_aborted: bool = False
+    baseline_failed_test_ids: set[str] = field(default_factory=set)
 
 
 _gremlin_session: GremlinSession | None = None
@@ -1008,6 +1011,40 @@ def pytest_runtestloop(session: pytest.Session) -> collections.abc.Generator[Non
     private_cov.save()
 
 
+def pytest_collectreport(report: pytest.CollectReport) -> None:
+    """Count failed collection reports so a broken baseline can skip mutation testing."""
+    gremlin_session = _get_session()
+    if gremlin_session is None or not gremlin_session.enabled:
+        return
+    if report.failed:
+        gremlin_session.collection_errors += 1
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Record each test that failed in any phase so the baseline gate sees real test outcomes.
+
+    Node IDs are collected in a set because one test can fail in more than one
+    phase (for example call and teardown) and must still count once.
+    """
+    gremlin_session = _get_session()
+    if gremlin_session is None or not gremlin_session.enabled:
+        return
+    if report.failed:
+        gremlin_session.baseline_failed_test_ids.add(report.nodeid)
+
+
+def pytest_keyboard_interrupt(excinfo: pytest.ExceptionInfo[BaseException]) -> None:  # noqa: ARG001
+    """Record that the baseline session was cut short (``pytest.exit`` or Ctrl-C).
+
+    pytest calls this for every ``pytest.exit`` regardless of its return code, so a
+    ``returncode=0`` exit is still recognised as an aborted baseline.
+    """
+    gremlin_session = _get_session()
+    if gremlin_session is None or not gremlin_session.enabled:
+        return
+    gremlin_session.baseline_aborted = True
+
+
 def pytest_collection_finish(session: pytest.Session) -> None:
     """After test collection, discover source files and generate gremlins.
 
@@ -1661,7 +1698,7 @@ def _cleanup_instrumented_dir(instrumented_dir: Path | None) -> None:
 
 
 @pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """After all tests run, execute mutation testing.
 
     **Two-phase xdist flow**: when xdist is active, this hook (decorated with
@@ -1678,30 +1715,14 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # n
     if _is_xdist_worker(session.config):
         return
 
+    if _skip_mutation_unless_baseline_is_green(gremlin_session, exitstatus):
+        return
+
     config = session.config
     rootdir = _get_rootdir(config)
 
     if gremlin_session.xdist_active:
-        xdist_ids = gremlin_session.xdist_item_ids or []
-        if not xdist_ids:
-            logger.warning(
-                'pytest_sessionfinish: xdist Phase 2 starting with zero item IDs; '
-                'pytest_xdist_node_collection_finished may not have fired'
-            )
-        normalized = _make_node_ids_relative(xdist_ids, rootdir)
-        gremlin_session.test_node_ids = {nid: nid for nid in normalized}
-        xdist_name_to_nodes: dict[str, list[str]] = {}
-        for nid in normalized:
-            func_name = nid.split('::')[-1]
-            xdist_name_to_nodes.setdefault(func_name, []).append(nid)
-        gremlin_session.test_name_to_node_ids = xdist_name_to_nodes
-        gremlin_session.total_tests = len(normalized)
-        logger.debug('pytest_sessionfinish: xdist Phase 2 reconstructed %d test node IDs', len(normalized))
-        source_files = _discover_source_files(session, gremlin_session)
-        gremlin_session.source_files = source_files
-        logger.debug('pytest_sessionfinish: xdist Phase 2 discovered %d source files', len(source_files))
-        _generate_gremlins(gremlin_session, source_files, rootdir)
-        logger.debug('pytest_sessionfinish: xdist Phase 2 generated %d gremlins', len(gremlin_session.gremlins))
+        _rebuild_state_from_xdist_workers(session, gremlin_session, rootdir)
 
     if not gremlin_session.gremlins:
         if gremlin_session.explain_gremlin_id is not None:
@@ -1731,6 +1752,98 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # n
         return
 
     gremlin_session.results = _dispatch_mutation_run(session, gremlin_session)
+
+
+def _rebuild_state_from_xdist_workers(
+    session: pytest.Session,
+    gremlin_session: GremlinSession,
+    rootdir: Path,
+) -> None:
+    """Reconstruct the item list from worker-reported IDs and generate gremlins (xdist Phase 2)."""
+    xdist_ids = gremlin_session.xdist_item_ids or []
+    if not xdist_ids:
+        logger.warning(
+            'pytest_sessionfinish: xdist Phase 2 starting with zero item IDs; '
+            'pytest_xdist_node_collection_finished may not have fired'
+        )
+    normalized = _make_node_ids_relative(xdist_ids, rootdir)
+    gremlin_session.test_node_ids = {nid: nid for nid in normalized}
+    xdist_name_to_nodes: dict[str, list[str]] = {}
+    for nid in normalized:
+        func_name = nid.split('::')[-1]
+        xdist_name_to_nodes.setdefault(func_name, []).append(nid)
+    gremlin_session.test_name_to_node_ids = xdist_name_to_nodes
+    gremlin_session.total_tests = len(normalized)
+    logger.debug('pytest_sessionfinish: xdist Phase 2 reconstructed %d test node IDs', len(normalized))
+    source_files = _discover_source_files(session, gremlin_session)
+    gremlin_session.source_files = source_files
+    logger.debug('pytest_sessionfinish: xdist Phase 2 discovered %d source files', len(source_files))
+    _generate_gremlins(gremlin_session, source_files, rootdir)
+    logger.debug('pytest_sessionfinish: xdist Phase 2 generated %d gremlins', len(gremlin_session.gremlins))
+
+
+_FIXED_BASELINE_SKIP_REASONS: dict[int, str] = {
+    pytest.ExitCode.INTERRUPTED: 'the baseline test session was interrupted; rerun it to completion first',
+    pytest.ExitCode.USAGE_ERROR: 'pytest reported a usage error (exit 4)',
+    pytest.ExitCode.NO_TESTS_COLLECTED: 'no tests were collected',
+}
+
+
+_POSSIBLY_GREEN_STATUSES = (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED)
+
+_NON_TEST_CHECK_NOTE = (
+    'pytest-gremlins: baseline tests all passed; the non-zero exit came from a non-test check '
+    '(e.g. --cov-fail-under), so mutation testing continues'
+)
+
+
+def _baseline_skip_reason(gremlin_session: GremlinSession, exitstatus: int) -> str:
+    """Explain why a non-green baseline cannot back mutation verdicts."""
+    if gremlin_session.collection_errors:
+        return f'test collection failed ({gremlin_session.collection_errors} error(s)); fix the collection errors first'
+    failed_tests = len(gremlin_session.baseline_failed_test_ids)
+    if exitstatus == pytest.ExitCode.TESTS_FAILED and failed_tests:
+        return f'{failed_tests} baseline test(s) failed; mutation scores need a passing suite'
+    if gremlin_session.baseline_aborted and exitstatus in _POSSIBLY_GREEN_STATUSES:
+        return 'the baseline test session was stopped early (pytest.exit)'
+    return _FIXED_BASELINE_SKIP_REASONS.get(exitstatus, f'the baseline run ended with exit code {int(exitstatus)}')
+
+
+def _is_green_baseline(gremlin_session: GremlinSession, exitstatus: int) -> bool:
+    """Whether every baseline test ran to completion and passed.
+
+    Exit status 1 with no failed test report means a non-test check (such as
+    ``--cov-fail-under``) failed the run, which does not undermine the tests.
+    """
+    return (
+        exitstatus in _POSSIBLY_GREEN_STATUSES
+        and not gremlin_session.baseline_aborted
+        and not gremlin_session.collection_errors
+        and not gremlin_session.baseline_failed_test_ids
+    )
+
+
+def _skip_mutation_unless_baseline_is_green(gremlin_session: GremlinSession, exitstatus: int) -> bool:
+    """Disable mutation testing unless the baseline is positively green.
+
+    A gremlin is zapped when a covering test fails, so a baseline with failing
+    tests, collection errors, or an aborted run would yield unfounded verdicts.
+    This is an allowlist: only a completed run whose tests all passed proceeds
+    (exit status OK, or TESTS_FAILED caused solely by a non-test check, which
+    prints a note).  Anything else prints one reason to stderr and disables the
+    session so no report is rendered.  pytest's own exit status is never changed.
+
+    Returns:
+        True when the caller must stop without running mutation testing.
+    """
+    if _is_green_baseline(gremlin_session, exitstatus):
+        if exitstatus == pytest.ExitCode.TESTS_FAILED:
+            print(_NON_TEST_CHECK_NOTE, file=sys.stderr)
+        return False
+    reason = _baseline_skip_reason(gremlin_session, exitstatus)
+    print(f'pytest-gremlins: skipping mutation testing because {reason}', file=sys.stderr)
+    gremlin_session.enabled = False
+    return True
 
 
 def _maybe_short_circuit_for_explain(gremlin_session: GremlinSession) -> bool:
