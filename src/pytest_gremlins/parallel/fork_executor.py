@@ -1,5 +1,9 @@
 """Fork-per-batch executor for mutation testing with process isolation.
 
+Not reachable from the plugin: ``--gremlin-executor=fork`` is rejected at startup because
+it never ran the mutated code. Kept as groundwork for
+https://github.com/mikelane/pytest-gremlins/issues/532.
+
 Forks once per batch of gremlins, runs InProcessExecutor in the child,
 and pipes serialized results back to the parent via ``os.pipe()``.
 This provides process isolation (protecting the parent from side effects)
@@ -11,6 +15,7 @@ InProcessExecutor directly in the current process.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 import json
 import logging
 import os
@@ -53,6 +58,7 @@ class ForkExecutor:
         gremlin_ids: list[str],
         gremlin_module_map: dict[str, str],
         test_specs: list[str],
+        ineligible_specs: Collection[str] = frozenset(),
     ) -> list[WorkerResult]:
         """Test gremlins in forked child processes, one fork per batch.
 
@@ -60,6 +66,7 @@ class ForkExecutor:
             gremlin_ids: Gremlin IDs to test.
             gremlin_module_map: Mapping of gremlin ID to module name.
             test_specs: Test node IDs to run against each gremlin.
+            ineligible_specs: Node IDs that cannot be run faithfully without pytest.
 
         Returns:
             List of WorkerResult, one per gremlin.
@@ -69,7 +76,9 @@ class ForkExecutor:
 
         if not hasattr(os, 'fork'):
             logger.info('os.fork unavailable, falling back to in-process execution')
-            return InProcessExecutor(self._timeout).execute(gremlin_ids, gremlin_module_map, test_specs)
+            return InProcessExecutor(self._timeout).execute(
+                gremlin_ids, gremlin_module_map, test_specs, ineligible_specs
+            )
 
         # Everything below requires os.fork — unreachable on Windows,
         # tested on macOS/Linux via medium-marked fork tests.
@@ -77,7 +86,7 @@ class ForkExecutor:
         all_results: list[WorkerResult] = []
 
         for batch in batches:  # pragma: no cover — fork-only path, tested on Unix
-            results = self._execute_batch_in_fork(batch, gremlin_module_map, test_specs)
+            results = self._execute_batch_in_fork(batch, gremlin_module_map, test_specs, ineligible_specs)
             all_results.extend(results)
 
         return all_results  # pragma: no cover — fork-only path
@@ -87,6 +96,7 @@ class ForkExecutor:
         batch: list[str],
         gremlin_module_map: dict[str, str],
         test_specs: list[str],
+        ineligible_specs: Collection[str] = frozenset(),
     ) -> list[WorkerResult]:
         """Fork a child process, run a batch, pipe results back."""
         read_fd, write_fd = os.pipe()
@@ -96,7 +106,9 @@ class ForkExecutor:
             # Child process
             os.close(read_fd)
             try:
-                results = InProcessExecutor(self._timeout).execute(batch, gremlin_module_map, test_specs)
+                results = InProcessExecutor(self._timeout).execute(
+                    batch, gremlin_module_map, test_specs, ineligible_specs
+                )
                 payload = json.dumps(
                     [
                         {

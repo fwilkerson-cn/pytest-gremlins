@@ -301,6 +301,19 @@ for result in results:
 
 ---
 
+## Lightweight Runner (Disabled)
+
+The lightweight runner is disabled in 1.9.1: the runner script is no longer written, so
+`build_lightweight_command` always returns `None` and every gremlin runs through the pytest
+bootstrap. The pieces below remain, unused, as groundwork for the redesign tracked in
+[#538](https://github.com/mikelane/pytest-gremlins/issues/538). See
+[Parallel Execution](../architecture/parallelization.md#the-lightweight-runner-is-disabled).
+
+- `pytest_gremlins.parallel.runner_eligibility.is_lightweight_safe(item)` decides whether a
+  collected `pytest.Item` could be run as a bare call.
+- `pytest_gremlins.parallel.lightweight.LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE` (`70`) is the exit
+  code the runner uses to abstain; result mapping treats it as `ERROR`.
+
 ## ResultAggregator
 
 Thread-safe collection of results with progress tracking.

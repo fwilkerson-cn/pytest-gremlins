@@ -21,12 +21,9 @@ class DescribeCacheLargeScale:
     ) -> None:
         """Cache produces same mutation scores on warm rerun with many gremlins.
 
-        The synthetic benchmark has:
-        - 3 source files with ~70 lines each
-        - ~50+ mutations total
-        - 60+ test cases
-
-        This test simulates a similar setup to verify cache scales.
+        Targets one module with the comparison operator (about a dozen gremlins) while the suite
+        collects 25 tests. Every gremlin runs through a full pytest bootstrap, so the workload is
+        kept small enough for the medium time limit.
         """
         # Create source files similar to benchmark
         pytester_with_markers.makepyfile(
@@ -186,19 +183,12 @@ class TestIsZero:
             """,
         )
 
-        # Run without cache (baseline)
-        no_cache_start = time.perf_counter()
-        pytester_with_markers.runpytest(
-            '--gremlins',
-            '--gremlin-targets=calculator.py,validator.py',
-        )
-        no_cache_time = time.perf_counter() - no_cache_start
-
         # Cold cache run
         cold_start = time.perf_counter()
         pytester_with_markers.runpytest(
             '--gremlins',
-            '--gremlin-targets=calculator.py,validator.py',
+            '--gremlin-targets=validator.py',
+            '--gremlin-operators=comparison',
             '--gremlin-cache',
         )
         cold_time = time.perf_counter() - cold_start
@@ -207,7 +197,8 @@ class TestIsZero:
         warm_start = time.perf_counter()
         result = pytester_with_markers.runpytest(
             '--gremlins',
-            '--gremlin-targets=calculator.py,validator.py',
+            '--gremlin-targets=validator.py',
+            '--gremlin-operators=comparison',
             '--gremlin-cache',
         )
         warm_time = time.perf_counter() - warm_start
@@ -217,18 +208,11 @@ class TestIsZero:
 
         # Print timing info for debugging
         print('\n\nTiming results:')
-        print(f'  No cache:   {no_cache_time:.2f}s')
-        print(f'  Cold cache: {cold_time:.2f}s (overhead: {cold_time - no_cache_time:.2f}s)')
-        print(f'  Warm cache: {warm_time:.2f}s (speedup: {no_cache_time / warm_time:.1f}x)')
+        print(f'  Cold cache: {cold_time:.2f}s')
+        print(f'  Warm cache: {warm_time:.2f}s (speedup: {cold_time / warm_time:.1f}x)')
 
-        # Key assertions:
-        # 1. Warm cache MUST be faster than no cache
-        assert warm_time < no_cache_time, (
-            f'Warm cache ({warm_time:.2f}s) is NOT faster than no-cache ({no_cache_time:.2f}s)! '
-            'This is the critical bug - cache should provide speedup.'
-        )
-
-        # 2. Warm cache should be at least 2x faster than cold cache
+        # The cold run is the no-cache baseline: every gremlin runs through pytest, so a second
+        # no-cache run would only double the cost without adding a signal.
         speedup = cold_time / warm_time
         assert speedup >= 2.0, (
             f'Warm cache speedup is only {speedup:.1f}x vs cold cache. '

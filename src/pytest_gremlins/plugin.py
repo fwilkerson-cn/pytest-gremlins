@@ -69,9 +69,11 @@ from pytest_gremlins.instrumentation.transformer import (
 )
 from pytest_gremlins.parallel.aggregator import ResultAggregator
 from pytest_gremlins.parallel.batch_executor import BatchExecutor
-from pytest_gremlins.parallel.fork_executor import ForkExecutor
-from pytest_gremlins.parallel.inprocess_executor import InProcessExecutor
-from pytest_gremlins.parallel.lightweight import build_lightweight_command
+from pytest_gremlins.parallel.lightweight import (
+    LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE,
+    build_lightweight_command,
+    describe_runner_error,
+)
 from pytest_gremlins.parallel.pool import WorkerPool
 from pytest_gremlins.reporting.html import (
     HtmlReporter,
@@ -83,6 +85,10 @@ from pytest_gremlins.reporting.results import (
     GremlinResultStatus,
 )
 from pytest_gremlins.reporting.score import MutationScore
+from pytest_gremlins.xdist_options import (
+    addopts_without_xdist,
+    env_without_xdist_addopts,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -214,8 +220,8 @@ class GremlinSession:
             stripped (see :func:`_addopts_without_cov`), threaded into the subprocess
             runs as ``-o addopts=<...>`` so collection-affecting options such as
             ``--import-mode=importlib`` survive (issue #424).  ``''`` clears all addopts.
-            xdist options are left intact here; only the coverage pre-scan strips them
-            (see :func:`_addopts_without_xdist`).
+            xdist options are left intact here; the coverage pre-scan and every per-gremlin
+            run strip them (see :func:`pytest_gremlins.xdist_options.addopts_without_xdist`).
     """
 
     enabled: bool = False
@@ -244,6 +250,7 @@ class GremlinSession:
     batch_size: int = 10
     xdist_item_ids: list[str] | None = None
     xdist_active: bool = False
+    xdist_loaded: bool = False
     xdist_workers: int | None = None
     coverage_mode: CoverageMode = CoverageMode.PRIVATE
     private_coverage: coverage.Coverage | None = None
@@ -572,7 +579,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default='auto',
         choices=['auto', 'subprocess', 'fork', 'inprocess'],
         dest='gremlin_executor',
-        help='Execution strategy: auto (default: fork on Unix, subprocess on Windows), subprocess, fork, inprocess.',
+        help=(
+            'Execution strategy: auto (default, same as subprocess) or subprocess. '
+            'fork and inprocess are disabled pending https://github.com/mikelane/pytest-gremlins/issues/532.'
+        ),
     )
     group.addoption(
         '--gremlin-no-coverage-filter',
@@ -754,6 +764,25 @@ def _resolve_coverage_timeout(merged_config: GremlinConfig) -> int:
     return merged_config.coverage_timeout
 
 
+DISABLED_EXECUTORS = ('fork', 'inprocess')
+EXECUTOR_REDESIGN_ISSUE_URL = 'https://github.com/mikelane/pytest-gremlins/issues/532'
+
+
+def _reject_disabled_executor(executor: str) -> None:
+    """Fail at startup for executors that did not run the mutated code.
+
+    Raises:
+        pytest.UsageError: If ``executor`` is ``fork`` or ``inprocess``.
+    """
+    if executor in DISABLED_EXECUTORS:
+        raise pytest.UsageError(
+            f'pytest-gremlins: --gremlin-executor={executor} is temporarily disabled because it produced '
+            'incorrect results (it did not run the mutated code). '
+            'Use --gremlin-executor=subprocess (the default). '
+            f'Tracking: {EXECUTOR_REDESIGN_ISSUE_URL}'
+        )
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Configure pytest-gremlins based on command-line options.
 
@@ -766,6 +795,8 @@ def pytest_configure(config: pytest.Config) -> None:
     if not config.option.gremlins:
         _set_session(GremlinSession(enabled=False))
         return
+
+    _reject_disabled_executor(getattr(config.option, 'gremlin_executor', 'auto'))
 
     # xdist with -n > 0 distributes test items across workers; gremlins runs
     # its mutation phase sequentially after xdist tears down (two-phase mode).
@@ -855,6 +886,7 @@ def pytest_configure(config: pytest.Config) -> None:
             no_coverage_filter=bool(getattr(config.option, 'gremlin_no_coverage_filter', False)),
             explain_gremlin_id=getattr(config.option, 'gremlin_explain', None),
             xdist_active=xdist_active,
+            xdist_loaded=config.pluginmanager.hasplugin('xdist'),
             xdist_workers=xdist_worker_int if xdist_active else None,
             preserved_addopts=_addopts_without_cov(config.getini('addopts')),
             coverage_timeout=coverage_timeout,
@@ -1342,8 +1374,8 @@ del _gremlin_os
     bootstrap_script = temp_dir / 'gremlin_bootstrap.py'
     bootstrap_script.write_text(_get_bootstrap_script())
 
-    lightweight_runner = temp_dir / 'gremlin_lightweight_runner.py'
-    lightweight_runner.write_text(_get_lightweight_runner_script(), encoding='utf-8')
+    # The lightweight runner is deliberately not written: it cannot reproduce pytest's conftest,
+    # configure hooks or sys.path, so every gremlin runs through the bootstrap (#538).
 
     return temp_dir
 
@@ -1415,33 +1447,6 @@ def _path_to_module_name(file_path: Path, rootdir: Path) -> str:
         parts = parts[1:]
 
     return '.'.join(parts)
-
-
-def _build_gremlin_module_map(
-    gremlins: list[Gremlin],
-    rootdir: Path,
-) -> dict[str, str]:
-    """Map gremlin IDs to their module names for in-process execution.
-
-    Args:
-        gremlins: List of gremlins to map.
-        rootdir: Root directory of the project.
-
-    Returns:
-        Dictionary mapping gremlin IDs to dotted module names.
-    """
-    gremlin_module_map: dict[str, str] = {}
-    for gremlin in gremlins:
-        file_path = Path(gremlin.file_path)
-        try:
-            rel_path = file_path.relative_to(rootdir)
-        except ValueError:
-            rel_path = Path(file_path.name)
-        module_name = str(rel_path).replace(os.sep, '.').removesuffix('.py')
-        if module_name.endswith('.__init__'):
-            module_name = module_name.removesuffix('.__init__')
-        gremlin_module_map[gremlin.gremlin_id] = module_name
-    return gremlin_module_map
 
 
 def _get_bootstrap_script() -> str:
@@ -1527,24 +1532,32 @@ def _get_lightweight_runner_script() -> str:
     """Return a lightweight test runner that avoids full pytest startup.
 
     Instead of running ``pytest.main()``, this script directly imports test
-    modules and calls test functions.  This eliminates ~900ms of pytest
-    framework overhead per subprocess, reducing per-gremlin cost from ~950ms
-    to ~50ms.
+    modules and calls test functions.  When it was enabled it skipped ~900ms
+    of pytest startup per subprocess, at the cost of not reproducing what
+    pytest does around a test call.
 
     The runner handles class-based tests (``TestFoo::test_bar``) and
     function-based tests (``test_bar``), with ``-x`` semantics (stop on
-    first failure).  Exit 0 = survived, exit 1 = zapped.
+    first failure).  Exit 0 = survived, exit 1 = zapped, and
+    ``LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE`` = the runner could not run a test
+    faithfully and abstains rather than fabricate a verdict.
+
+    The runner is not written by ``_write_instrumented_sources`` while it is disabled
+    (https://github.com/mikelane/pytest-gremlins/issues/538); the generator is kept as groundwork.
 
     Returns:
         The lightweight runner script source code.
     """
-    return '''#!/usr/bin/env python
-"""Lightweight test runner for pytest-gremlins — skips full pytest startup."""
+    script = '''#!/usr/bin/env python
+"""Lightweight test runner for pytest-gremlins -- skips full pytest startup."""
 
 import importlib.util
+import inspect
 import json
 import os
 import sys
+import traceback
+import unittest
 
 
 def setup_import_hooks():
@@ -1598,37 +1611,85 @@ def load_test_module(file_path):
     return module
 
 
+CANNOT_VERIFY_EXIT_CODE = __CANNOT_VERIFY_EXIT_CODE__
+PASSED = 'passed'
+CAUGHT = 'caught'
+CANNOT_VERIFY = 'cannot_verify'
+OUTCOME_MODULES = ('builtins', '_pytest.outcomes')
+UNEXECUTED_OUTCOMES = ('Skipped', 'XFailed')
+
+
+def cannot_verify(test_spec, reason):
+    """Report why a test could not be judged without pytest, and abstain."""
+    sys.stderr.write('pytest-gremlins lightweight runner cannot verify %s: %s\\n' % (test_spec, reason))
+    return CANNOT_VERIFY
+
+
+def is_unexecuted_outcome(exc):
+    """Return True when a pytest skip/xfail was raised from inside the test body."""
+    if isinstance(exc, unittest.SkipTest):
+        return True
+    return type(exc).__module__ in OUTCOME_MODULES and type(exc).__name__ in UNEXECUTED_OUTCOMES
+
+
+def resolve_test_callable(module, parts):
+    """Return (callable, None) or (None, reason) for the node ID parts after the file."""
+    owner = module
+    if len(parts) == 2:
+        cls = getattr(module, parts[0], None)
+        if cls is None:
+            return None, 'class %s not found' % parts[0]
+        try:
+            owner = cls()
+        except Exception as exc:
+            return None, 'class %s could not be instantiated: %r' % (parts[0], exc)
+    func = getattr(owner, parts[-1], None)
+    if not callable(func):
+        return None, 'test %s not found' % parts[-1]
+    try:
+        inspect.signature(func).bind()
+    except TypeError:
+        return None, 'test requires arguments (fixtures or parametrization)'
+    except ValueError:
+        pass
+    return func, None
+
+
 def run_test(test_spec, rootdir):
-    """Run a single test from its node ID. Returns True if passed."""
+    """Run a single test from its node ID.
+
+    Returns PASSED, CAUGHT (the test body raised), or CANNOT_VERIFY when the
+    test cannot be run faithfully as a bare callable.
+    """
     parts = test_spec.split('::')
-    file_path = parts[0]
-    full_path = os.path.join(rootdir, file_path)
+    if len(parts) not in (2, 3):
+        return cannot_verify(test_spec, 'unexpected node ID format')
 
     try:
-        module = load_test_module(full_path)
-        if module is None:
-            return False  # Cannot verify = treat as caught
+        module = load_test_module(os.path.join(rootdir, parts[0]))
+    except Exception as exc:
+        return cannot_verify(test_spec, 'test module failed to load: %r' % (exc,))
+    if module is None:
+        return cannot_verify(test_spec, 'test module could not be imported')
 
-        if len(parts) == 3:
-            cls = getattr(module, parts[1], None)
-            if cls is None:
-                return False  # Cannot verify = treat as caught
-            instance = cls()
-            method = getattr(instance, parts[2], None)
-            if method is None:
-                return False  # Cannot verify = treat as caught
-            method()
-        elif len(parts) == 2:
-            func = getattr(module, parts[1], None)
-            if func is None:
-                return False  # Cannot verify = treat as caught
-            func()
-        else:
-            return False  # Unexpected node ID format = treat as caught
+    func, reason = resolve_test_callable(module, parts[1:])
+    if func is None:
+        return cannot_verify(test_spec, reason)
 
-        return True
-    except Exception:
-        return False
+    try:
+        returned = func()
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        if is_unexecuted_outcome(exc):
+            return cannot_verify(test_spec, 'test was skipped or xfailed at runtime')
+        return CAUGHT
+
+    if inspect.isawaitable(returned) or inspect.isgenerator(returned):
+        if hasattr(returned, 'close'):
+            returned.close()
+        return cannot_verify(test_spec, 'test returned an awaitable or generator that pytest would drive')
+    return PASSED
 
 
 def setup_pythonpath(rootdir):
@@ -1674,17 +1735,31 @@ def main():
     setup_pythonpath(rootdir)
     setup_import_hooks()
 
-    test_specs = sys.argv[1:]
-    for spec in test_specs:
-        if not run_test(spec, rootdir):
+    unverifiable = False
+    for spec in sys.argv[1:]:
+        outcome = run_test(spec, rootdir)
+        if outcome == CAUGHT:
             sys.exit(1)
+        if outcome == CANNOT_VERIFY:
+            unverifiable = True
 
-    sys.exit(0)
+    sys.exit(CANNOT_VERIFY_EXIT_CODE if unverifiable else 0)
+
+
+def guarded_main():
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc()
+        sys.exit(CANNOT_VERIFY_EXIT_CODE)
 
 
 if __name__ == '__main__':
-    main()
+    guarded_main()
 '''
+    return script.replace('__CANNOT_VERIFY_EXIT_CODE__', str(LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE))
 
 
 def _cleanup_instrumented_dir(instrumented_dir: Path | None) -> None:
@@ -2143,61 +2218,6 @@ _COVERAGE_CORE_RC_LINE = 'core = ctrace'
 _PRESCAN_OVERRIDING_ENV_VARS = frozenset({'COVERAGE_CORE', 'COVERAGE_FILE'})
 
 
-# pytest-xdist options that take a value.  Written either inline (``--dist=load``) or
-# with the value as the next token (``--dist load``).
-_XDIST_VALUE_OPTS = frozenset(
-    {
-        '--numprocesses',
-        '--maxprocesses',
-        '--dist',
-        '--max-worker-restart',
-        '--tx',
-        '--px',
-        '--rsyncdir',
-        '--rsyncignore',
-        '--testrunuid',
-        '--maxschedchunk',
-    }
-)
-
-# pytest-xdist switches that take no value.
-_XDIST_FLAG_ONLY_OPTS = frozenset(
-    {'-d', '--distributed', '--loadscope-reorder', '--no-loadscope-reorder', '-f', '--looponfail'}
-)
-
-
-def _is_attached_short_numprocesses(arg: str) -> bool:
-    """Return True for ``-n4`` / ``-nauto`` (the value glued to the short option)."""
-    return arg.startswith('-n') and not arg.startswith('--') and len(arg) > len('-n')
-
-
-def _addopts_without_xdist(addopts: str) -> str:
-    """Return ``addopts`` with pytest-xdist options removed.
-
-    The coverage pre-scan is one ``coverage run -m pytest`` process.  Under ``-n auto``
-    the tests execute in xdist workers that coverage.py does not trace, so the pre-scan
-    records nothing and coverage-guided selection silently degrades to running every
-    test per gremlin (issue #502).  ``-n``/``--numprocesses`` and the other xdist option
-    families are therefore dropped; value-taking options also drop their separate value
-    arg.
-    """
-    args = shlex.split(addopts)
-    kept: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        index += 1
-        name = arg.split('=', 1)[0]
-        takes_separate_value = (name in _XDIST_VALUE_OPTS and '=' not in arg) or arg == '-n'
-        if takes_separate_value:
-            index += 1
-        elif name in _XDIST_VALUE_OPTS or arg in _XDIST_FLAG_ONLY_OPTS or _is_attached_short_numprocesses(arg):
-            continue
-        else:
-            kept.append(arg)
-    return ' '.join(shlex.quote(arg) for arg in kept)
-
-
 def _prescan_env() -> dict[str, str]:
     """Return the environment for the pre-scan subprocess.
 
@@ -2208,11 +2228,7 @@ def _prescan_env() -> dict[str, str]:
     (issue #502); xdist options are stripped from it and the variable is dropped if empty.
     """
     env = {key: value for key, value in os.environ.items() if key not in _PRESCAN_OVERRIDING_ENV_VARS}
-    pytest_addopts = env.pop('PYTEST_ADDOPTS', '')
-    remaining = _addopts_without_xdist(pytest_addopts)
-    if remaining:
-        env['PYTEST_ADDOPTS'] = remaining
-    return env
+    return env_without_xdist_addopts(env)
 
 
 def _run_tests_with_coverage(
@@ -2250,8 +2266,8 @@ def _run_tests_with_coverage(
             (see :func:`_addopts_without_cov`), passed through as ``-o addopts=<...>``
             so collection-affecting options such as ``--import-mode=importlib`` survive
             into the subprocess. Defaults to ``''`` (clear all addopts). pytest-xdist
-            options (``-n``, ``--dist``, ...) are additionally stripped by
-            :func:`_addopts_without_xdist` (as is ``PYTEST_ADDOPTS``, see
+            options (``-n``, ``--dist``, ...) are stripped by
+            :func:`~pytest_gremlins.xdist_options.addopts_without_xdist` (as is ``PYTEST_ADDOPTS``, see
             :func:`_prescan_env`), because coverage.py does not trace xdist workers
             and the pre-scan would otherwise record nothing (issue #502).  The xdist
             plugin itself stays loaded: without ``-n`` it runs in-process, so its
@@ -2294,7 +2310,7 @@ def _run_tests_with_coverage(
         '-p',
         'no:gremlins',
         '-o',
-        f'addopts={_addopts_without_xdist(preserved_addopts)}',
+        f'addopts={addopts_without_xdist(preserved_addopts)}',
         *test_node_ids,
         '--tb=no',
         '-q',
@@ -2390,7 +2406,11 @@ def _run_batch_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912
         List of results for each gremlin.
     """
     rootdir = _get_rootdir(session.config)
-    base_test_command = _build_test_command(gremlin_session.instrumented_dir, gremlin_session.preserved_addopts)
+    base_test_command = _build_test_command(
+        gremlin_session.instrumented_dir,
+        gremlin_session.preserved_addopts,
+        xdist_loaded=gremlin_session.xdist_loaded,
+    )
     gremlins = gremlin_session.gremlins
 
     # Build gremlin -> test mapping for filtering (prioritized order)
@@ -2516,7 +2536,11 @@ def _run_parallel_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912, 
         List of results for each gremlin.
     """
     rootdir = _get_rootdir(session.config)
-    base_test_command = _build_test_command(gremlin_session.instrumented_dir, gremlin_session.preserved_addopts)
+    base_test_command = _build_test_command(
+        gremlin_session.instrumented_dir,
+        gremlin_session.preserved_addopts,
+        xdist_loaded=gremlin_session.xdist_loaded,
+    )
     gremlins = gremlin_session.gremlins
 
     # Build gremlin -> test mapping for filtering (prioritized order)
@@ -2622,52 +2646,6 @@ def _run_parallel_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912, 
 
         # Cache the result
         _cache_gremlin_result(gremlin, selected_tests, gremlin_result, gremlin_session)
-
-    return results
-
-
-def _run_mutation_testing_inprocess(
-    executor_choice: str,
-    gremlin_session: GremlinSession,
-    rootdir: Path,
-    base_test_command: list[str],
-) -> list[GremlinResult]:
-    """Run mutation testing using fork or in-process executor."""
-    gremlin_module_map = _build_gremlin_module_map(gremlin_session.gremlins, rootdir)
-    test_specs = [arg for arg in base_test_command if '::' in arg]
-    timeout = gremlin_session.timeout if hasattr(gremlin_session, 'timeout') else 30
-    batch_size = gremlin_session.batch_size if hasattr(gremlin_session, 'batch_size') else 50
-
-    gremlin_ids = [g.gremlin_id for g in gremlin_session.gremlins if not g.pardoned]
-
-    if executor_choice == 'fork':
-        executor: InProcessExecutor | ForkExecutor = ForkExecutor(batch_size=batch_size, timeout=timeout)
-    else:
-        executor = InProcessExecutor(timeout=timeout)
-
-    worker_results = executor.execute(gremlin_ids, gremlin_module_map, test_specs)
-
-    results: list[GremlinResult] = []
-    gremlin_by_id = {g.gremlin_id: g for g in gremlin_session.gremlins}
-    for worker_result in worker_results:
-        gremlin = gremlin_by_id.get(worker_result.gremlin_id)
-        if gremlin is None:
-            continue
-        results.append(
-            GremlinResult(
-                gremlin=gremlin,
-                status=worker_result.status,
-                killing_test=worker_result.killing_test,
-                execution_time_ms=worker_result.execution_time_ms,
-                error_output=worker_result.error_output,
-            )
-        )
-
-    # Add pardoned gremlins
-    for gremlin in gremlin_session.gremlins:
-        pardoned_result = _immediate_result_if_pardoned(gremlin)
-        if pardoned_result is not None:
-            results.append(pardoned_result)
 
     return results
 
@@ -2840,25 +2818,11 @@ def _run_mutation_testing(
     """
     results: list[GremlinResult] = []
     rootdir = _get_rootdir(session.config)
-    base_test_command = _build_test_command(gremlin_session.instrumented_dir, gremlin_session.preserved_addopts)
-
-    executor_choice = (
-        session.config.option.gremlin_executor if hasattr(session.config.option, 'gremlin_executor') else 'subprocess'
+    base_test_command = _build_test_command(
+        gremlin_session.instrumented_dir,
+        gremlin_session.preserved_addopts,
+        xdist_loaded=gremlin_session.xdist_loaded,
     )
-
-    if executor_choice == 'auto':
-        # TODO: resolve to 'fork' on Unix once the fork executor supports
-        # coverage-guided selection, progress reporting, and cache integration.
-        # For now, auto = subprocess (safe default, full pipeline).
-        executor_choice = 'subprocess'
-
-    if executor_choice in ('fork', 'inprocess'):
-        return _run_mutation_testing_inprocess(
-            executor_choice,
-            gremlin_session,
-            rootdir,
-            base_test_command,
-        )
 
     for i, gremlin in enumerate(gremlin_session.gremlins, 1):
         pardoned_result = _immediate_result_if_pardoned(gremlin)
@@ -3166,7 +3130,12 @@ def _pytest_cov_available() -> bool:
         return True
 
 
-def _build_test_command(instrumented_dir: Path | None, preserved_addopts: str = '') -> list[str]:
+def _build_test_command(
+    instrumented_dir: Path | None,
+    preserved_addopts: str = '',
+    *,
+    xdist_loaded: bool = False,
+) -> list[str]:
     """Build the command to run tests.
 
     If an instrumented directory is provided, uses the bootstrap script
@@ -3182,11 +3151,20 @@ def _build_test_command(instrumented_dir: Path | None, preserved_addopts: str = 
         preserved_addopts: The project's ``addopts`` with pytest-cov flags stripped
             (see :func:`_addopts_without_cov`), passed through as ``-o addopts=<...>``
             so collection-affecting options such as ``--import-mode=importlib`` survive
-            into the subprocess. Defaults to ``''`` (clear all addopts).
+            into the subprocess. Defaults to ``''`` (clear all addopts). xdist options
+            are dropped (see :func:`~pytest_gremlins.xdist_options.addopts_without_xdist`)
+            so the tests run in the bootstrap process, where the gremlin import hook lives.
+        xdist_loaded: Whether pytest-xdist is loaded in the main session.  If so, ``-n 0`` is
+            appended as a second layer: argparse keeps the last value, so no spelling of ``-n``
+            in ``addopts`` or ``PYTEST_ADDOPTS`` (for example a clustered ``-xn 2``, which the
+            token stripper does not recognise) can distribute the run.  xdist itself stays
+            loaded, so ``worker_id`` still works.  Without xdist the flag would be rejected as
+            unrecognized, so it is omitted.
 
     Returns:
         Command list to run tests.
     """
+    gremlin_addopts = addopts_without_xdist(preserved_addopts)
     if instrumented_dir is not None:
         bootstrap_script = instrumented_dir / 'gremlin_bootstrap.py'
         command = [
@@ -3196,7 +3174,7 @@ def _build_test_command(instrumented_dir: Path | None, preserved_addopts: str = 
             '--tb=no',
             '-q',
             '-o',
-            f'addopts={preserved_addopts}',
+            f'addopts={gremlin_addopts}',
         ]
     else:
         command = [
@@ -3207,11 +3185,14 @@ def _build_test_command(instrumented_dir: Path | None, preserved_addopts: str = 
             '--tb=no',
             '-q',
             '-o',
-            f'addopts={preserved_addopts}',
+            f'addopts={gremlin_addopts}',
         ]
 
     if _pytest_cov_available():
         command.append('--no-cov')
+
+    if xdist_loaded:
+        command.extend(['-n', '0'])
 
     return command
 
@@ -3254,7 +3235,7 @@ def _test_gremlin(
     Returns:
         Result of testing the gremlin.
     """
-    env = os.environ.copy()
+    env = env_without_xdist_addopts(os.environ)
     env[ACTIVE_GREMLIN_ENV_VAR] = gremlin.gremlin_id
     env['GREMLIN_ROOTDIR'] = str(rootdir)
 
@@ -3262,7 +3243,8 @@ def _test_gremlin(
         sources_file = instrumented_dir / 'sources.json'
         env[GREMLIN_SOURCES_ENV_VAR] = str(sources_file)
 
-    # Use lightweight runner if available (skips full pytest startup)
+    # Single routing point for the lightweight runner. It always returns None while the runner is
+    # disabled (#538), so every gremlin runs through the pytest bootstrap.
     lightweight_cmd = build_lightweight_command(test_command, env)
     effective_command = lightweight_cmd if lightweight_cmd is not None else test_command
 
@@ -3291,9 +3273,7 @@ def _test_gremlin(
                 status=GremlinResultStatus.ZAPPED,
                 killing_test='unknown',
             )
-        error_output = ''
-        if subprocess_outcome.stderr:
-            error_output = subprocess_outcome.stderr.decode(errors='replace')[:2000]
+        error_output = describe_runner_error(subprocess_outcome.returncode, subprocess_outcome.stderr)
         logger.debug(
             'Gremlin %s error (exit %d): %s',
             gremlin.gremlin_id,

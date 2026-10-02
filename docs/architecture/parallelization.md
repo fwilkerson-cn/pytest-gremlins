@@ -209,6 +209,36 @@ def worker_main(mutations: list[str], result_queue: Queue):
         result_queue.put(result)
 ```
 
+## The Lightweight Runner Is Disabled
+
+Every gremlin runs its tests through the real pytest bootstrap. Earlier releases routed
+gremlins to a lightweight runner that imported the test module and called the test function
+directly, without starting pytest. That is only faithful for a test that needs nothing from
+pytest, and it fabricated verdicts for async, parametrized and fixture-taking tests, for tests
+that depend on `conftest.py` imports or `pytest_configure` hooks, and for tests that import
+helpers from pytest's `sys.path` (the test file's directory or an ini `pythonpath`). Gating
+which tests it may judge kept leaking cases, so it is off in 1.9.1 and the redesign is tracked in
+[#538](https://github.com/mikelane/pytest-gremlins/issues/538). Plain suites are slower as a
+result (roughly 5x in one measurement), in exchange for verdicts that come from pytest itself.
+
+The eligibility predicate (`is_lightweight_safe`), the runner script generator and the
+`70` "cannot verify" exit code are kept, unused, as groundwork for that redesign.
+
+### Fork and in-process executors are disabled
+
+`--gremlin-executor=fork` and `--gremlin-executor=inprocess` fail at startup with a usage error
+(exit code 4) that names the value you passed and points to `--gremlin-executor=subprocess`, the
+default. They toggled a flag in the pytest process, whose modules are never instrumented, so they
+did not run the mutated code and could report every gremlin as a survivor. The redesign is
+tracked in [#532](https://github.com/mikelane/pytest-gremlins/issues/532). The `ForkExecutor` and
+`InProcessExecutor` classes remain in the code base for that work but are not reachable from the
+command line.
+
+### Cached results
+
+The incremental cache key includes a runner fidelity version (`rf3`), so verdicts cached by
+v1.9.0 or by interim builds, which used the lightweight runner, are recomputed once after upgrading.
+
 ## Configuration
 
 ### Number of Workers

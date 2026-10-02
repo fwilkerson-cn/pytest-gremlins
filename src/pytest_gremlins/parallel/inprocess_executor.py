@@ -1,5 +1,9 @@
 """In-process executor for mutation testing via __gremlin_active__ toggling.
 
+Not reachable from the plugin: ``--gremlin-executor=inprocess`` is rejected at startup
+because toggling the flag in the pytest process never ran the mutated code. Kept as
+groundwork for https://github.com/mikelane/pytest-gremlins/issues/532.
+
 Eliminates subprocess overhead by toggling module-level ``__gremlin_active__``
 variables directly in the current process, then calling test functions.
 This is 263x faster than subprocess per mutation on microbenchmarks.
@@ -12,8 +16,12 @@ will route those to the subprocess executor.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import (
+    Callable,
+    Collection,
+)
 import enum
+import inspect
 import logging
 import sys
 import time
@@ -59,16 +67,22 @@ class InProcessExecutor:
         gremlin_ids: list[str],
         gremlin_module_map: dict[str, str],
         test_specs: list[str],
+        ineligible_specs: Collection[str] = frozenset(),
     ) -> list[WorkerResult]:
         """Test gremlins by toggling __gremlin_active__ and running tests in-process.
 
         For each gremlin: sets the target module's ``__gremlin_active__`` to the
         gremlin ID, runs all test specs, records the result, then resets to None.
 
+        Tests are called as bare callables, so a spec listed in ``ineligible_specs``
+        (fixtures, parametrization, coroutines, ...) is never called: a gremlin
+        selecting one yields ERROR rather than a fabricated verdict.
+
         Args:
             gremlin_ids: Gremlin IDs to test.
             gremlin_module_map: Mapping of gremlin ID to module name.
             test_specs: Test node IDs (e.g. ``'tests/test_foo.py::test_bar'``).
+            ineligible_specs: Node IDs that cannot be run faithfully without pytest.
 
         Returns:
             List of WorkerResult, one per gremlin.
@@ -78,7 +92,7 @@ class InProcessExecutor:
 
         results: list[WorkerResult] = []
         for gremlin_id in gremlin_ids:
-            result = self._test_single_gremlin(gremlin_id, gremlin_module_map, test_specs)
+            result = self._test_single_gremlin(gremlin_id, gremlin_module_map, test_specs, ineligible_specs)
             results.append(result)
 
         return results
@@ -88,15 +102,22 @@ class InProcessExecutor:
         gremlin_id: str,
         gremlin_module_map: dict[str, str],
         test_specs: list[str],
+        ineligible_specs: Collection[str] = frozenset(),
     ) -> WorkerResult:
         """Toggle __gremlin_active__, run tests, reset, return result."""
         module_name = gremlin_module_map.get(gremlin_id)
         module = sys.modules.get(module_name) if module_name else None
+        unjudgeable = _unjudgeable_reason(module, module_name, test_specs, ineligible_specs)
+        if unjudgeable is not None or module is None:
+            return WorkerResult(
+                gremlin_id=gremlin_id,
+                status=GremlinResultStatus.ERROR,
+                error_output=unjudgeable or '',
+            )
 
         start = time.monotonic()
         try:
-            if module is not None:
-                module.__gremlin_active__ = gremlin_id  # type: ignore[attr-defined]
+            module.__gremlin_active__ = gremlin_id  # type: ignore[attr-defined]
 
             for spec in test_specs:
                 outcome = _run_test_spec(spec)
@@ -133,8 +154,7 @@ class InProcessExecutor:
                 error_output=str(exc)[:2000],
             )
         finally:
-            if module is not None:
-                module.__gremlin_active__ = None  # type: ignore[attr-defined]
+            module.__gremlin_active__ = None  # type: ignore[attr-defined]
 
 
 def _run_test_spec(spec: str) -> _TestOutcome:
@@ -143,7 +163,8 @@ def _run_test_spec(spec: str) -> _TestOutcome:
     Returns:
         ``PASSED`` if the test callable ran without exception.
         ``FAILED`` if the test callable raised an exception (mutation caught).
-        ``ERROR`` if the module or callable could not be resolved (infrastructure).
+        ``ERROR`` if the module or callable could not be resolved (infrastructure),
+        or the call returned an awaitable (the body never ran).
 
     Handles both function-level (``module::func``) and class-level
     (``module::Class::method``) test node IDs.
@@ -158,10 +179,44 @@ def _run_test_spec(spec: str) -> _TestOutcome:
         return _TestOutcome.ERROR
 
     try:
-        callable_fn()
+        returned = callable_fn()
     except Exception:
         return _TestOutcome.FAILED
+    if inspect.isawaitable(returned):
+        if inspect.iscoroutine(returned):
+            returned.close()
+        return _TestOutcome.ERROR
     return _TestOutcome.PASSED
+
+
+MAX_SPECS_SHOWN = 3
+
+
+def _unjudgeable_reason(
+    module: object,
+    module_name: str | None,
+    test_specs: list[str],
+    ineligible_specs: Collection[str],
+) -> str | None:
+    """Explain why no honest verdict is possible, or return None when the gremlin can be judged."""
+    if not test_specs:
+        return 'No tests were run, so the gremlin cannot be judged.'
+    blocked = [spec for spec in test_specs if spec in ineligible_specs]
+    if blocked:
+        return _ineligible_message(blocked)
+    if module is None or not hasattr(module, '__gremlin_active__'):
+        return f'Module {module_name!r} is not instrumented in this process, so toggling it changes nothing.'
+    return None
+
+
+def _ineligible_message(blocked: list[str]) -> str:
+    shown = ', '.join(blocked[:MAX_SPECS_SHOWN])
+    hidden = len(blocked) - MAX_SPECS_SHOWN
+    more = f' (+{hidden} more)' if hidden > 0 else ''
+    return (
+        f'{len(blocked)} selected test(s) cannot be run without pytest (fixtures, parametrization, '
+        f'async or skip/xfail): {shown}{more}. Use --gremlin-executor=subprocess to judge them.'
+    )
 
 
 def _resolve_test_callable(module: object, parts: list[str]) -> Callable[..., Any] | None:

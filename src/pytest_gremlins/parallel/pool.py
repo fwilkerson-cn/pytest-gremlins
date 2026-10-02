@@ -23,8 +23,12 @@ import subprocess
 import time
 from typing import Self
 
-from pytest_gremlins.parallel.lightweight import build_lightweight_command
+from pytest_gremlins.parallel.lightweight import (
+    build_lightweight_command,
+    describe_runner_error,
+)
 from pytest_gremlins.reporting.results import GremlinResultStatus
+from pytest_gremlins.xdist_options import env_without_xdist_addopts
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +80,7 @@ def _run_gremlin_test(  # pragma: no cover
     """
     start_time = time.monotonic()
 
-    env = os.environ.copy()
-    env.update(env_vars)
+    env = env_without_xdist_addopts({**os.environ, **env_vars})
     env['ACTIVE_GREMLIN'] = gremlin_id
     env['GREMLIN_ROOTDIR'] = rootdir
 
@@ -113,9 +116,7 @@ def _run_gremlin_test(  # pragma: no cover
                 killing_test='unknown',
                 execution_time_ms=execution_time_ms,
             )
-        error_output = ''
-        if result.stderr:
-            error_output = result.stderr.decode(errors='replace')[:2000]
+        error_output = describe_runner_error(result.returncode, result.stderr)
         return WorkerResult(
             gremlin_id=gremlin_id,
             status=GremlinResultStatus.ERROR,
