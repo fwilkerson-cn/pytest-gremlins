@@ -290,6 +290,9 @@ class GremlinSession:
 
 
 _gremlin_session: GremlinSession | None = None
+_displaced_session_key = pytest.StashKey[GremlinSession | None]()
+_own_session_key = pytest.StashKey[GremlinSession]()
+_configured_configs: list[pytest.Config] = []
 
 
 def _extract_test_name_from_context(context: str) -> str:
@@ -396,6 +399,75 @@ def _set_session(session: GremlinSession | None) -> None:
     """Set the current gremlin session."""
     global _gremlin_session  # noqa: PLW0603
     _gremlin_session = session
+
+
+def _install_session(config: pytest.Config, session: GremlinSession) -> None:
+    """Make ``session`` the current session and the one ``config`` owns."""
+    config.stash[_own_session_key] = session
+    _set_session(session)
+
+
+def _release_session(config: pytest.Config) -> None:
+    """Clean up the session ``config`` owns and hand its place to the session it displaced.
+
+    Configs can unconfigure in any order, so a still-configured Config that displaced this
+    one's session is repointed at what this one displaced.
+    """
+    _configured_configs[:] = [configured for configured in _configured_configs if configured is not config]
+    owned = config.stash[_own_session_key]
+    displaced = config.stash[_displaced_session_key]
+    for configured in _configured_configs:
+        if configured.stash[_displaced_session_key] is owned:
+            configured.stash[_displaced_session_key] = displaced
+    _cleanup_instrumented_dir(owned.instrumented_dir)
+    if owned.cache is not None:
+        owned.cache.close()
+    if _get_session() is owned:
+        _set_session(displaced)
+
+
+class _BaselineRecorder:
+    """Records one Config's baseline test outcomes into the session that Config owns.
+
+    Report hooks carry no Config, so each Config registers its own recorder: a report
+    reaches only the session of the Config whose run produced it.
+    """
+
+    def __init__(self, config: pytest.Config) -> None:
+        """Bind the recorder to ``config``."""
+        self._config = config
+
+    def _enabled_session(self) -> GremlinSession | None:
+        gremlin_session = self._config.stash.get(_own_session_key, None)
+        if gremlin_session is None or not gremlin_session.enabled:
+            return None
+        return gremlin_session
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        """Count failed collection reports so a broken baseline can skip mutation testing."""
+        gremlin_session = self._enabled_session()
+        if gremlin_session is not None and report.failed:
+            gremlin_session.collection_errors += 1
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        """Record each test that failed in any phase so the baseline gate sees real test outcomes.
+
+        Node IDs are collected in a set because one test can fail in more than one
+        phase (for example call and teardown) and must still count once.
+        """
+        gremlin_session = self._enabled_session()
+        if gremlin_session is not None and report.failed:
+            gremlin_session.baseline_failed_test_ids.add(report.nodeid)
+
+    def pytest_keyboard_interrupt(self, excinfo: pytest.ExceptionInfo[BaseException]) -> None:  # noqa: ARG002
+        """Record that the baseline session was cut short (``pytest.exit`` or Ctrl-C).
+
+        pytest calls this for every ``pytest.exit`` regardless of its return code, so a
+        ``returncode=0`` exit is still recognised as an aborted baseline.
+        """
+        gremlin_session = self._enabled_session()
+        if gremlin_session is not None:
+            gremlin_session.baseline_aborted = True
 
 
 def _workers_type(value: str) -> int:
@@ -758,7 +830,7 @@ def _maybe_short_circuit_for_inactive_run(config: pytest.Config) -> bool:
     """
     if not getattr(config.option, 'collectonly', False):
         return False
-    _set_session(GremlinSession(enabled=False))
+    _install_session(config, GremlinSession(enabled=False))
     if not _is_xdist_worker(config):
         print('pytest-gremlins: --collect-only detected, skipping mutation testing', file=sys.stderr)
     return True
@@ -811,8 +883,11 @@ def pytest_configure(config: pytest.Config) -> None:
     2. pyproject.toml [tool.pytest-gremlins] section
     3. Built-in defaults (all operators, src/ directory, console report, batch-size 10)
     """
+    config.stash[_displaced_session_key] = _get_session()
+    _configured_configs.append(config)
+    _install_session(config, GremlinSession(enabled=False))
+    config.pluginmanager.register(_BaselineRecorder(config))
     if not config.option.gremlins:
-        _set_session(GremlinSession(enabled=False))
         return
 
     _reject_disabled_executor(getattr(config.option, 'gremlin_executor', 'auto'))
@@ -884,7 +959,8 @@ def pytest_configure(config: pytest.Config) -> None:
     coverage_timeout = _resolve_coverage_timeout(merged_config)
     report_formats: list[str] = toml_report if toml_report is not None else ['console']
 
-    _set_session(
+    _install_session(
+        config,
         GremlinSession(
             enabled=True,
             operators=operators,
@@ -909,7 +985,7 @@ def pytest_configure(config: pytest.Config) -> None:
             xdist_workers=xdist_worker_int if xdist_active else None,
             preserved_addopts=_addopts_without_cov(config.getini('addopts')),
             coverage_timeout=coverage_timeout,
-        )
+        ),
     )
 
 
@@ -1060,40 +1136,6 @@ def pytest_runtestloop(session: pytest.Session) -> collections.abc.Generator[Non
     yield
     private_cov.stop()
     private_cov.save()
-
-
-def pytest_collectreport(report: pytest.CollectReport) -> None:
-    """Count failed collection reports so a broken baseline can skip mutation testing."""
-    gremlin_session = _get_session()
-    if gremlin_session is None or not gremlin_session.enabled:
-        return
-    if report.failed:
-        gremlin_session.collection_errors += 1
-
-
-def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    """Record each test that failed in any phase so the baseline gate sees real test outcomes.
-
-    Node IDs are collected in a set because one test can fail in more than one
-    phase (for example call and teardown) and must still count once.
-    """
-    gremlin_session = _get_session()
-    if gremlin_session is None or not gremlin_session.enabled:
-        return
-    if report.failed:
-        gremlin_session.baseline_failed_test_ids.add(report.nodeid)
-
-
-def pytest_keyboard_interrupt(excinfo: pytest.ExceptionInfo[BaseException]) -> None:  # noqa: ARG001
-    """Record that the baseline session was cut short (``pytest.exit`` or Ctrl-C).
-
-    pytest calls this for every ``pytest.exit`` regardless of its return code, so a
-    ``returncode=0`` exit is still recognised as an aborted baseline.
-    """
-    gremlin_session = _get_session()
-    if gremlin_session is None or not gremlin_session.enabled:
-        return
-    gremlin_session.baseline_aborted = True
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -3689,12 +3731,9 @@ def pytest_terminal_summary(  # noqa: C901, PLR0912, PLR0915
             )
 
 
-def pytest_unconfigure(config: pytest.Config) -> None:  # noqa: ARG001
-    """Clean up after pytest-gremlins."""
-    gremlin_session = _get_session()
-    if gremlin_session is not None:
-        _cleanup_instrumented_dir(gremlin_session.instrumented_dir)
-        # Close the cache to release database connection
-        if gremlin_session.cache is not None:
-            gremlin_session.cache.close()
-    _set_session(None)
+@pytest.hookimpl(hookwrapper=True)
+def pytest_unconfigure(config: pytest.Config) -> collections.abc.Generator[None, None, None]:
+    """Clean up the session this Config owns and restore the one it displaced."""
+    yield
+    if any(configured is config for configured in _configured_configs):
+        _release_session(config)

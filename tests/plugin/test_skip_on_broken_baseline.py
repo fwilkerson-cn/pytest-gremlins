@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Literal
-from unittest.mock import patch
 
 import pytest
 
 from pytest_gremlins.plugin import (
     GremlinSession,
+    _BaselineRecorder,
+    _own_session_key,
     _skip_mutation_unless_baseline_is_green,
-    pytest_runtest_logreport,
 )
 
 SKIP_PREFIX = 'pytest-gremlins: skipping mutation testing because '
@@ -105,13 +106,19 @@ def _failed_report(node_id: str, when: Literal['setup', 'call', 'teardown']) -> 
     return pytest.TestReport(node_id, (node_id, 0, node_id), {}, 'failed', None, when)
 
 
+def _recorder_for(gremlin_session: GremlinSession) -> _BaselineRecorder:
+    config = SimpleNamespace(stash=pytest.Stash())
+    config.stash[_own_session_key] = gremlin_session
+    return _BaselineRecorder(config)  # type: ignore[arg-type]
+
+
 @pytest.mark.small
 class DescribeBaselineFailureCounting:
     def it_counts_a_test_failing_in_both_call_and_teardown_once(self, capsys: pytest.CaptureFixture[str]) -> None:
         gremlin_session = GremlinSession(enabled=True)
-        with patch('pytest_gremlins.plugin._get_session', return_value=gremlin_session):
-            pytest_runtest_logreport(_failed_report(FAILING_NODE_ID, 'call'))
-            pytest_runtest_logreport(_failed_report(FAILING_NODE_ID, 'teardown'))
+        recorder = _recorder_for(gremlin_session)
+        recorder.pytest_runtest_logreport(_failed_report(FAILING_NODE_ID, 'call'))
+        recorder.pytest_runtest_logreport(_failed_report(FAILING_NODE_ID, 'teardown'))
 
         _skip_mutation_unless_baseline_is_green(gremlin_session, pytest.ExitCode.TESTS_FAILED)
 
@@ -119,9 +126,9 @@ class DescribeBaselineFailureCounting:
 
     def it_counts_each_distinct_failing_test(self, capsys: pytest.CaptureFixture[str]) -> None:
         gremlin_session = GremlinSession(enabled=True)
-        with patch('pytest_gremlins.plugin._get_session', return_value=gremlin_session):
-            pytest_runtest_logreport(_failed_report(FAILING_NODE_ID, 'call'))
-            pytest_runtest_logreport(_failed_report('tests/test_calc.py::test_sub', 'setup'))
+        recorder = _recorder_for(gremlin_session)
+        recorder.pytest_runtest_logreport(_failed_report(FAILING_NODE_ID, 'call'))
+        recorder.pytest_runtest_logreport(_failed_report('tests/test_calc.py::test_sub', 'setup'))
 
         _skip_mutation_unless_baseline_is_green(gremlin_session, pytest.ExitCode.TESTS_FAILED)
 
