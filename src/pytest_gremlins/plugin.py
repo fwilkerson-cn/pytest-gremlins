@@ -56,6 +56,14 @@ from pytest_gremlins.config import (
     load_config,
     merge_configs,
 )
+from pytest_gremlins.control_run import (
+    MAX_SELECTION_FAILURE_OUTPUT_CHARS,
+    SELECTION_FAILS_TO_LOAD_PREFIX,
+    UNATTRIBUTABLE_MARKER,
+    ControlRunOutcome,
+    build_diagnostic,
+    run_control,
+)
 from pytest_gremlins.coverage import (
     CoverageCollector,
     PrioritizedSelector,
@@ -69,6 +77,10 @@ from pytest_gremlins.instrumentation.transformer import (
 )
 from pytest_gremlins.parallel.aggregator import ResultAggregator
 from pytest_gremlins.parallel.batch_executor import BatchExecutor
+from pytest_gremlins.parallel.exit_codes import (
+    COLLECTION_KILLING_TEST,
+    GREMLIN_COLLECTION_FAILED_EXIT_CODE,
+)
 from pytest_gremlins.parallel.lightweight import (
     LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE,
     build_lightweight_command,
@@ -199,6 +211,11 @@ class GremlinSession:
         parallel_workers: Number of parallel workers (None = CPU count).
         batch_enabled: Whether batch execution mode is enabled.
         batch_size: Number of gremlins per batch in batch mode.
+        load_failures_attributable: ``False`` once the unmutated control run failed to load the suite
+            in the gremlin subprocess; load failures then say nothing about a mutant (issue #550).
+        unmutated_load_checks: Memo of unmutated ``--collect-only`` results keyed by the ordered node ids
+            (pytest collects them in command order, and loading can depend on it), so a selection
+            shared by many gremlins is checked once.
         xdist_item_ids: Test node IDs captured from the first xdist worker after
             collection finishes.  ``None`` until the hook fires; ``[]`` if the
             worker collected nothing.
@@ -249,6 +266,8 @@ class GremlinSession:
     batch_enabled: bool = False
     batch_size: int = 10
     xdist_item_ids: list[str] | None = None
+    load_failures_attributable: bool = True
+    unmutated_load_checks: dict[tuple[str, ...], ControlRunOutcome] = field(default_factory=dict)
     xdist_active: bool = False
     xdist_loaded: bool = False
     xdist_workers: int | None = None
@@ -1467,7 +1486,7 @@ def _get_bootstrap_script() -> str:
     # The bootstrap script uses exec() to run compiled code in module namespace.
     # This is the standard Python pattern for import loaders (see importlib docs).
     # The code being executed is our own instrumented AST, not untrusted input.
-    return """#!/usr/bin/env python
+    script = """#!/usr/bin/env python
 '''Bootstrap script for pytest-gremlins mutation testing.
 
 This script registers import hooks to intercept module imports and provide
@@ -1520,12 +1539,54 @@ def main():
 
     # Now run pytest with remaining arguments
     import pytest
-    sys.exit(pytest.main(sys.argv[1:]))
+    from _pytest.config import ConftestImportFailure
+
+    class SuiteLoadRecorder:
+        # Records, in-process, that the suite could not be loaded. pytest reports an
+        # unloadable suite with exit code 2 or 4, and our own bad arguments with 4 too,
+        # so the exit code alone cannot tell a mutant-caused failure from our bug.
+        def __init__(self):
+            self.suite_failed_to_load = False
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_load_initial_conftests(self, early_config, parser, args):
+            outcome = yield
+            if outcome.excinfo is not None and issubclass(outcome.excinfo[0], ConftestImportFailure):
+                self.suite_failed_to_load = True
+
+        def pytest_collectreport(self, report):
+            if report.failed:
+                self.suite_failed_to_load = True
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_collection(self, session):
+            outcome = yield
+            if outcome.excinfo is None or not issubclass(outcome.excinfo[0], pytest.UsageError):
+                return
+            # A requested node id that is not found (for example a changed parametrize id) is the
+            # mutant's doing, but only if the file it names still exists. A missing file is ours.
+            if all(os.path.exists(argument.split('::')[0]) for argument in session.config.args):
+                self.suite_failed_to_load = True
+
+    # The parent writes this marker when its unmutated control run could not load the suite here,
+    # in which case a load failure says nothing about the mutant and must stay a plain pytest error.
+    marker = os.path.join(os.path.dirname(sources_file), '__UNATTRIBUTABLE_MARKER__')
+    can_attribute_load_failures = not os.path.exists(marker)
+
+    recorder = SuiteLoadRecorder()
+    exit_code = pytest.main(sys.argv[1:], plugins=[recorder])
+    load_failure_exit = exit_code in (pytest.ExitCode.USAGE_ERROR, pytest.ExitCode.INTERRUPTED)
+    if can_attribute_load_failures and recorder.suite_failed_to_load and load_failure_exit:
+        exit_code = __COLLECTION_FAILED_EXIT_CODE__
+    sys.exit(exit_code)
 
 
 if __name__ == '__main__':
     main()
 """
+    return script.replace('__COLLECTION_FAILED_EXIT_CODE__', str(GREMLIN_COLLECTION_FAILED_EXIT_CODE)).replace(
+        '__UNATTRIBUTABLE_MARKER__', UNATTRIBUTABLE_MARKER
+    )
 
 
 def _get_lightweight_runner_script() -> str:
@@ -1826,7 +1887,113 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if _maybe_short_circuit_for_explain(gremlin_session):
         return
 
+    _verify_suite_loads_unmutated(session, gremlin_session)
     gremlin_session.results = _dispatch_mutation_run(session, gremlin_session)
+
+
+def _verify_suite_loads_unmutated(session: pytest.Session, gremlin_session: GremlinSession) -> None:
+    """Check that the gremlin subprocess can load the unmutated suite, before any gremlin runs.
+
+    A load failure under a mutant is only attributable to the mutant if the same subprocess
+    harness loads the suite cleanly without one. The baseline run is a different process, so it
+    cannot vouch for that. When the control run fails, a marker next to ``sources.json`` makes the
+    bootstrap stop reporting load failures as kills, so every mapping site scores them as errors.
+    Only gremlins that will actually run count: pardoned and cached ones are skipped, and when none
+    is left no subprocess is spawned and nothing is printed. The union of the remaining selections is
+    an early-out only; each collection kill is confirmed against its own selection by
+    :func:`_confirm_collection_kill`.
+    """
+    instrumented_dir = gremlin_session.instrumented_dir
+    if instrumented_dir is None:
+        return
+    gremlins_to_run = 0
+    selected_node_ids: set[str] = set()
+    for gremlin in gremlin_session.gremlins:
+        if _immediate_result_if_pardoned(gremlin) is not None:
+            continue
+        selected_tests = _select_tests_for_gremlin_prioritized(gremlin, gremlin_session)
+        if _check_cache_for_gremlin(gremlin, selected_tests, gremlin_session) is not None:
+            continue
+        selected_node_ids.update(_node_ids_for_tests(selected_tests, gremlin_session))
+        gremlins_to_run += 1
+    if not gremlins_to_run:
+        return
+    outcome = _collect_unmutated(gremlin_session, _get_rootdir(session.config), sorted(selected_node_ids))
+    logger.debug('Unmutated control run took %.1fs (loads cleanly: %s)', outcome.seconds, outcome.loads_cleanly)
+    if outcome.loads_cleanly:
+        return
+    gremlin_session.load_failures_attributable = False
+    (instrumented_dir / UNATTRIBUTABLE_MARKER).write_text('', encoding='utf-8')
+    print(build_diagnostic(outcome.output), file=sys.stderr)
+
+
+def _collect_unmutated(
+    gremlin_session: GremlinSession,
+    rootdir: Path,
+    node_ids: Sequence[str],
+) -> ControlRunOutcome:
+    """Collect ``node_ids`` with the bootstrap, using a gremlin run's command and env minus the gremlin."""
+    instrumented_dir = gremlin_session.instrumented_dir
+    command = _build_test_command(
+        instrumented_dir,
+        gremlin_session.preserved_addopts,
+        xdist_loaded=gremlin_session.xdist_loaded,
+    )
+    env = env_without_xdist_addopts(os.environ)
+    env.pop(ACTIVE_GREMLIN_ENV_VAR, None)
+    env['GREMLIN_ROOTDIR'] = str(rootdir)
+    if instrumented_dir is not None:
+        env[GREMLIN_SOURCES_ENV_VAR] = str(instrumented_dir / 'sources.json')
+    return run_control(command, node_ids, rootdir, env)
+
+
+def _confirm_collection_kill(
+    result: GremlinResult,
+    node_ids: Sequence[str],
+    gremlin_session: GremlinSession,
+    rootdir: Path,
+) -> GremlinResult:
+    """Keep a collection kill only if the unmutated run of the gremlin's own selection loads.
+
+    The control run vouches for the union of all selected tests, but a gremlin collects only its
+    own subset, and a subset can fail to load without its siblings (for example a module that
+    needs ``sys.path`` changes made by another module). The check runs in the parent, where the
+    result arrives, so the memo is shared by every execution mode and pool worker processes need
+    no state of their own. It costs one collect-only run per distinct selection, and only for
+    gremlins that were reported as collection kills.
+
+    Args:
+        result: The gremlin's result from the subprocess.
+        node_ids: The node ids the gremlin's subprocess was asked to run, in command order.
+        gremlin_session: The current gremlin session, holding the memo.
+        rootdir: Root directory of the project.
+
+    Returns:
+        ``result`` unchanged, or an ERROR result when the unmutated selection fails to load.
+    """
+    if result.status != GremlinResultStatus.ZAPPED or result.killing_test != COLLECTION_KILLING_TEST:
+        return result
+    selection = tuple(node_ids)
+    if selection not in gremlin_session.unmutated_load_checks:
+        gremlin_session.unmutated_load_checks[selection] = _collect_unmutated(gremlin_session, rootdir, node_ids)
+    outcome = gremlin_session.unmutated_load_checks[selection]
+    if outcome.loads_cleanly:
+        return result
+    return dataclass_replace(
+        result,
+        status=GremlinResultStatus.ERROR,
+        killing_test=None,
+        error_output=f'{SELECTION_FAILS_TO_LOAD_PREFIX}\n{outcome.output[-MAX_SELECTION_FAILURE_OUTPUT_CHARS:]}',
+    )
+
+
+def _node_ids_for_tests(selected_tests: Sequence[str], gremlin_session: GremlinSession) -> list[str]:
+    """Return the node ids behind ``selected_tests``, in order, skipping names with no node id."""
+    return [
+        gremlin_session.test_node_ids[test_name]
+        for test_name in selected_tests
+        if test_name in gremlin_session.test_node_ids
+    ]
 
 
 def _rebuild_state_from_xdist_workers(
@@ -2511,6 +2678,10 @@ def _run_batch_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912
             error_output=worker_result.error_output,
             selected_tests=selected_tests,
         )
+        # Batch runs every gremlin with the one unified command, so that is the selection to confirm.
+        gremlin_result = _confirm_collection_kill(
+            gremlin_result, _node_ids_for_tests(all_covering_tests, gremlin_session), gremlin_session, rootdir
+        )
         results.append(gremlin_result)
 
         # Cache the result
@@ -2641,6 +2812,9 @@ def _run_parallel_mutation_testing(  # pragma: no cover  # noqa: C901, PLR0912, 
             execution_time_ms=worker_result.execution_time_ms,
             error_output=worker_result.error_output,
             selected_tests=selected_tests,
+        )
+        gremlin_result = _confirm_collection_kill(
+            gremlin_result, _node_ids_for_tests(selected_tests, gremlin_session), gremlin_session, rootdir
         )
         results.append(gremlin_result)
 
@@ -2860,6 +3034,9 @@ def _run_mutation_testing(
         )
         # Attach selected tests for debuggability in reports
         gremlin_result = dataclass_replace(gremlin_result, selected_tests=selected_tests)
+        gremlin_result = _confirm_collection_kill(
+            gremlin_result, _node_ids_for_tests(selected_tests, gremlin_session), gremlin_session, rootdir
+        )
 
         # Cache the result for next run
         _cache_gremlin_result(gremlin, selected_tests, gremlin_result, gremlin_session)
@@ -2970,6 +3147,14 @@ def _cache_gremlin_result(
         gremlin_session: The current gremlin session.
     """
     if not gremlin_session.cache_enabled or gremlin_session.cache is None:
+        return
+
+    # A verdict scored while load failures were unattributable, or downgraded because the unmutated
+    # selection does not load, depends on a harness problem the user is told to fix; replaying it
+    # from a warm cache after the fix would keep reporting stale errors.
+    if not gremlin_session.load_failures_attributable:
+        return
+    if (result.error_output or '').startswith(SELECTION_FAILS_TO_LOAD_PREFIX):
         return
 
     source_hash = gremlin_session.source_hashes.get(gremlin.file_path, '')
@@ -3100,14 +3285,7 @@ def _build_filtered_test_command(
     """
     command = list(base_command)
 
-    node_ids = [
-        gremlin_session.test_node_ids[test_name]
-        for test_name in selected_tests
-        if test_name in gremlin_session.test_node_ids
-    ]
-
-    if node_ids:
-        command.extend(node_ids)
+    command.extend(_node_ids_for_tests(selected_tests, gremlin_session))
 
     return command
 
@@ -3272,6 +3450,12 @@ def _test_gremlin(
                 gremlin=gremlin,
                 status=GremlinResultStatus.ZAPPED,
                 killing_test='unknown',
+            )
+        if subprocess_outcome.returncode == GREMLIN_COLLECTION_FAILED_EXIT_CODE:
+            return GremlinResult(
+                gremlin=gremlin,
+                status=GremlinResultStatus.ZAPPED,
+                killing_test=COLLECTION_KILLING_TEST,
             )
         error_output = describe_runner_error(subprocess_outcome.returncode, subprocess_outcome.stderr)
         logger.debug(
