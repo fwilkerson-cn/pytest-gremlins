@@ -10,6 +10,7 @@ once, with no active gremlin, in ``--collect-only`` mode, and explains the resul
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import subprocess
 import time
 from typing import TYPE_CHECKING
@@ -48,19 +49,16 @@ _DIAGNOSTIC_INTRO = (
     "can't be attributed to mutants; they're reported as errors. Cause:"
 )
 
+_ANSI_SGR_SEQUENCE = re.compile(r'\x1b\[[0-9;]*m')
+
 _HINTS = (
     (
-        '__file__',
-        'Hint: a module reads __file__ at import time, but instrumented modules have no __file__ '
-        '(see https://github.com/mikelane/pytest-gremlins/issues/525).',
-    ),
-    (
-        'import file mismatch',
+        r'import file mismatch',
         'Hint: an option such as --import-mode was given only on the command line; put it in addopts '
         'so the gremlin subprocess receives it.',
     ),
     (
-        'not found:',
+        r'^ERROR: not found:',
         'Hint: a test id differs between processes (for example a parametrize id built from uuid, '
         'random or faker); make the ids deterministic.',
     ),
@@ -102,7 +100,8 @@ def chunk_node_ids(node_ids: Sequence[str], max_chars: int) -> list[list[str]]:
 def build_diagnostic(output: str) -> str:
     """Build the stderr message for a failed control run, with hints for the common causes."""
     tail = '\n'.join(output.strip().splitlines()[-DIAGNOSTIC_TAIL_LINES:])
-    hints = [hint for needle, hint in _HINTS if needle in output]
+    uncolored = _ANSI_SGR_SEQUENCE.sub('', output)
+    hints = [hint for pattern, hint in _HINTS if re.search(pattern, uncolored, re.MULTILINE)]
     return '\n'.join([_DIAGNOSTIC_INTRO, tail, *hints])
 
 
@@ -132,7 +131,7 @@ def run_control(
     for chunk in chunk_node_ids(node_ids, max_chars_per_command):
         try:
             completed = subprocess.run(  # Intentional: runs the pytest bootstrap
-                [*command, '--collect-only', *chunk],
+                [*command, '--collect-only', '--tb=short', *chunk],
                 cwd=str(cwd),
                 env=dict(env),
                 capture_output=True,
