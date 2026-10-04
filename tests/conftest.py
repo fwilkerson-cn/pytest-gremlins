@@ -144,6 +144,7 @@ def make_pytest_config() -> Callable[..., Any]:
         cfg.option = option  # type: ignore[attr-defined]
         cfg.rootdir = rootdir  # type: ignore[attr-defined]
         cfg.pluginmanager = pm  # type: ignore[attr-defined]
+        cfg.stash = pytest.Stash()  # type: ignore[attr-defined]
         return cfg
 
     return _factory
