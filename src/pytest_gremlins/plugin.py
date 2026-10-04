@@ -70,6 +70,7 @@ from pytest_gremlins.coverage import (
     TestSelector,
 )
 from pytest_gremlins.coverage.context_plugin import GremlinContextPlugin
+from pytest_gremlins.gremlins_options import addopts_without_gremlins
 from pytest_gremlins.instrumentation.switcher import ACTIVE_GREMLIN_ENV_VAR
 from pytest_gremlins.instrumentation.transformer import (
     get_default_registry,
@@ -2448,10 +2449,16 @@ def _prescan_env() -> dict[str, str]:
     ``COVERAGE_FILE`` redirects the data file away from ``rootdir/.coverage``, which is read
     afterwards, so both are removed.  pytest appends ``PYTEST_ADDOPTS`` to every invocation,
     so ``-n 2`` there would distribute the pre-scan just like ``-n 2`` in ``addopts``
-    (issue #502); xdist options are stripped from it and the variable is dropped if empty.
+    (issue #502), and a gremlins option there is unrecognized under ``-p no:gremlins``.
+    Both are stripped from it and the variable is dropped if empty.
     """
-    env = {key: value for key, value in os.environ.items() if key not in _PRESCAN_OVERRIDING_ENV_VARS}
-    return env_without_xdist_addopts(env)
+    env = env_without_xdist_addopts(
+        {key: value for key, value in os.environ.items() if key not in _PRESCAN_OVERRIDING_ENV_VARS}
+    )
+    remaining = addopts_without_gremlins(env.pop('PYTEST_ADDOPTS', ''))
+    if remaining:
+        env['PYTEST_ADDOPTS'] = remaining
+    return env
 
 
 def _run_tests_with_coverage(
@@ -2533,7 +2540,7 @@ def _run_tests_with_coverage(
         '-p',
         'no:gremlins',
         '-o',
-        f'addopts={addopts_without_xdist(preserved_addopts)}',
+        f'addopts={addopts_without_gremlins(addopts_without_xdist(preserved_addopts))}',
         *test_node_ids,
         '--tb=no',
         '-q',
