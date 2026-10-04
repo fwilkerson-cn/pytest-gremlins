@@ -68,7 +68,7 @@ class DescribeCollectionFailedMapping:
 
         monkeypatch.setattr('pytest_gremlins.plugin.subprocess.run', fake_run)
 
-        result = _test_gremlin(sample_gremlin, ['pytest'], tmp_path, instrumented_dir=None)
+        result = _test_gremlin(sample_gremlin, ['pytest'], tmp_path, instrumented_dir=None, timeout=30)
 
         assert (result.status, result.killing_test) == (GremlinResultStatus.ZAPPED, COLLECTION_KILLING_TEST)
 
@@ -125,7 +125,7 @@ class DescribeUsageErrorsStayErrors:
 
         monkeypatch.setattr('pytest_gremlins.plugin.subprocess.run', fake_run)
 
-        result = _test_gremlin(sample_gremlin, ['pytest'], tmp_path, instrumented_dir=None)
+        result = _test_gremlin(sample_gremlin, ['pytest'], tmp_path, instrumented_dir=None, timeout=30)
 
         assert result.status == GremlinResultStatus.ERROR
 
