@@ -60,3 +60,42 @@ class DescribeXdistHookGuard:
         """Without xdist, pytest_xdist_node_collection_finished is not defined on the module."""
         mod = _load_plugin_fresh(block_xdist=True)
         assert not hasattr(mod, 'pytest_xdist_node_collection_finished')
+
+
+@pytest.mark.medium
+class DescribeXdistDisabledRuns:
+    """xdist hooks are safe when pytest disables the xdist plugin."""
+
+    def it_allows_pytest_to_disable_xdist_when_xdist_is_installed(self, pytester_with_markers: pytest.Pytester) -> None:
+        """When xdist is installed but disabled, gremlins' xdist hooks are optional."""
+        pytester_with_markers.makepyfile(
+            test_sample="""
+            def test_pass():
+                assert True
+            """,
+        )
+
+        result = pytester_with_markers.runpytest('-p', 'no:xdist', '-q')
+
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(['*1 passed*'])
+
+    def it_allows_gremlins_to_run_when_xdist_is_disabled(self, pytester_with_markers: pytest.Pytester) -> None:
+        """The mutation phase still runs sequentially with ``--gremlins -p no:xdist``."""
+        pytester_with_markers.makepyfile(
+            src_module="""
+            def answer():
+                return 42
+            """,
+            test_sample="""
+            from src_module import answer
+
+            def test_answer():
+                assert answer() == 42
+            """,
+        )
+
+        result = pytester_with_markers.runpytest('-p', 'no:xdist', '--gremlins', '-q')
+
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(['*1 passed*'])
