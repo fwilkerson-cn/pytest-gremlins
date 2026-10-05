@@ -10,6 +10,7 @@ once, with no active gremlin, in ``--collect-only`` mode, and explains the resul
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import re
 import subprocess
 import time
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
         Sequence,
     )
     from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 UNATTRIBUTABLE_MARKER = 'load_failures_unattributable'
 """File written next to ``sources.json`` when the control run failed; the bootstrap then stops
@@ -40,6 +43,11 @@ SELECTION_FAILS_TO_LOAD_PREFIX = (
     "can't be attributed to the mutant; output of the unmutated run:"
 )
 """Start of the ``error_output`` of a collection kill that was downgraded to ERROR."""
+
+TIMEOUT_CONFIRMATION_LAUNCH_ERROR_PREFIX = (
+    "timeout not counted as a kill: the gremlin's tests could not be launched without the mutant to confirm it; error:"
+)
+"""Start of the ``error_output`` of a timeout that cannot be confirmed due to a launch failure."""
 
 CONTROL_RUN_TIMEOUT_SECONDS = 300
 """Seconds one control command may run before the suite counts as unable to load."""
@@ -72,6 +80,58 @@ class ControlRunOutcome:
     loads_cleanly: bool
     output: str
     seconds: float
+
+
+@dataclass(frozen=True)
+class UnmutatedRunOutcome:
+    """Result of running a gremlin's selection of tests without a mutant."""
+
+    timed_out: bool
+    seconds: float
+    launch_error: str | None = None
+
+
+def run_unmutated(
+    command: Sequence[str],
+    node_ids: Sequence[str],
+    cwd: Path,
+    env: Mapping[str, str],
+    *,
+    timeout: int,
+) -> UnmutatedRunOutcome:
+    """Run the given node ids with the gremlin bootstrap and no active gremlin, under a timeout.
+
+    Only the time matters: a gremlin that timed out is a real kill only if the same selection
+    finishes in time without the mutant, whatever its exit code.
+
+    Args:
+        command: The base gremlin test command (bootstrap script plus options).
+        node_ids: Node ids the gremlin was asked to run, in command order.
+        cwd: Directory to run in (the project root).
+        env: Environment for the subprocess, without an active gremlin.
+        timeout: Seconds the run may take, the same limit the gremlin ran under.
+
+    Returns:
+        Whether the run outlasted ``timeout``, and how long it took. If the run cannot be launched,
+        a launch_error is set; this does not count as timing out, and the timeout confirmation
+        becomes an ERROR result instead.
+    """
+    started = time.monotonic()
+    try:
+        subprocess.run(  # Intentional: runs the pytest bootstrap
+            [*command, *node_ids],
+            cwd=str(cwd),
+            env=dict(env),
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return UnmutatedRunOutcome(timed_out=True, seconds=time.monotonic() - started)
+    except OSError as launch_error:
+        logger.warning('Could not run the unmutated selection to confirm a timeout: %s', launch_error)
+        return UnmutatedRunOutcome(timed_out=False, seconds=time.monotonic() - started, launch_error=str(launch_error))
+    return UnmutatedRunOutcome(timed_out=False, seconds=time.monotonic() - started)
 
 
 def chunk_node_ids(node_ids: Sequence[str], max_chars: int) -> list[list[str]]:
