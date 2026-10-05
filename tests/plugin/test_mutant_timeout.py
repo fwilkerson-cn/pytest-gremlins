@@ -155,10 +155,18 @@ from sample import classify
 @pytest.mark.medium
 def test_classify():
     if os.environ.get('ACTIVE_GREMLIN'):
-        time.sleep(3)
+        time.sleep({seconds})
     assert classify(11) == 'big'
     assert classify(10) == 'small'
 """
+
+# A timeout is only a kill when the unmutated run, which pays the pytest start-up, fits in half the limit
+# (issue #565). Start-up alone took 4-7s on a loaded CI runner, so these limits leave that run comfortably inside
+# half of them (the old 6s limit flaked), and the mutant sleeps either far past them or well under the roomy one.
+_LIMIT_THE_MUTANT_EXCEEDS = 20
+_MUTANT_SLEEP_PAST_ANY_LIMIT = 60
+_MUTANT_SLEEP_WITHIN_A_ROOMY_LIMIT = 3
+_ROOMY_LIMIT = 40
 
 _COMMON_ARGS = ('--gremlins', '--gremlin-targets=sample.py', '--gremlin-operators=comparison', '-p', 'no:cacheprovider')
 
@@ -177,51 +185,70 @@ def _verdicts(output: str) -> dict[str, int]:
     return {label: count(label) for label in ('Zapped', 'Survived', 'Timeout', 'Error')}
 
 
-def _run(pytester: pytest.Pytester, *args: str) -> pytest.RunResult:
-    pytester.makepyfile(sample=_TARGET, test_sample=_SLOW_UNDER_A_MUTANT)
+def _run(pytester: pytest.Pytester, *args: str, mutant_sleep: int = _MUTANT_SLEEP_PAST_ANY_LIMIT) -> pytest.RunResult:
+    pytester.makepyfile(sample=_TARGET, test_sample=_SLOW_UNDER_A_MUTANT.format(seconds=mutant_sleep))
     return pytester.runpytest_subprocess(*_COMMON_ARGS, *args)
 
 
 @pytest.mark.medium
 class DescribeMutantTimeoutEndToEnd:
-    """The TOML key and CLI flag bound each mutant's test run through the real entry point."""
+    """The TOML key and CLI flag bound each mutant's test run through the real entry point.
 
-    @pytest.mark.parametrize('mode', list(_EXECUTION_MODES))
-    def it_times_out_a_mutant_run_longer_than_the_toml_value(
-        self, pytester_with_markers: pytest.Pytester, mode: str
-    ) -> None:
-        pytester_with_markers.makepyprojecttoml('[tool.pytest-gremlins]\nmutant_timeout = 1\n')
+    Every mutant that times out costs the full limit, and twice that in a pooled mode, so the medium tier times
+    out mutants in the default mode only. DescribeMutantTimeoutEndToEndAcrossModes keeps the full matrix as large.
+    """
 
-        verdicts = _verdicts(_run(pytester_with_markers, *_EXECUTION_MODES[mode]).stdout.str())
+    def it_times_out_a_mutant_run_longer_than_the_toml_value(self, pytester_with_markers: pytest.Pytester) -> None:
+        pytester_with_markers.makepyprojecttoml(
+            f'[tool.pytest-gremlins]\nmutant_timeout = {_LIMIT_THE_MUTANT_EXCEEDS}\n'
+        )
 
+        output = _run(pytester_with_markers).stdout.str()
+
+        verdicts = _verdicts(output)
         assert verdicts['Timeout'] > 0
         assert verdicts['Zapped'] == 0
+        assert 'counted as errors, not kills' not in output
 
     @pytest.mark.parametrize('mode', list(_EXECUTION_MODES))
     def it_lets_the_cli_flag_win_over_the_toml_key(self, pytester_with_markers: pytest.Pytester, mode: str) -> None:
         pytester_with_markers.makepyprojecttoml('[tool.pytest-gremlins]\nmutant_timeout = 1\n')
 
         verdicts = _verdicts(
-            _run(pytester_with_markers, '--gremlin-mutant-timeout=20', *_EXECUTION_MODES[mode]).stdout.str()
+            _run(
+                pytester_with_markers,
+                f'--gremlin-mutant-timeout={_ROOMY_LIMIT}',
+                *_EXECUTION_MODES[mode],
+                mutant_sleep=_MUTANT_SLEEP_WITHIN_A_ROOMY_LIMIT,
+            ).stdout.str()
         )
 
         assert verdicts['Timeout'] == 0
         assert verdicts['Zapped'] > 0
 
-    def it_times_out_a_mutant_run_longer_than_the_cli_value(self, pytester_with_markers: pytest.Pytester) -> None:
-        verdicts = _verdicts(_run(pytester_with_markers, '--gremlin-mutant-timeout=1').stdout.str())
-
-        assert verdicts['Timeout'] > 0
-
-    def it_judges_a_cached_verdict_again_under_a_different_timeout(
+    def it_does_not_reuse_a_verdict_cached_under_a_different_timeout(
         self, pytester_with_markers: pytest.Pytester
     ) -> None:
-        first = _run(pytester_with_markers, '--gremlin-cache', '--gremlin-mutant-timeout=1')
-        second = _run(pytester_with_markers, '--gremlin-cache', '--gremlin-mutant-timeout=20')
-        third = _run(pytester_with_markers, '--gremlin-cache', '--gremlin-mutant-timeout=20')
+        first = _run(
+            pytester_with_markers,
+            '--gremlin-cache',
+            f'--gremlin-mutant-timeout={_LIMIT_THE_MUTANT_EXCEEDS}',
+            mutant_sleep=_MUTANT_SLEEP_WITHIN_A_ROOMY_LIMIT,
+        )
+        second = _run(
+            pytester_with_markers,
+            '--gremlin-cache',
+            f'--gremlin-mutant-timeout={_ROOMY_LIMIT}',
+            mutant_sleep=_MUTANT_SLEEP_WITHIN_A_ROOMY_LIMIT,
+        )
+        third = _run(
+            pytester_with_markers,
+            '--gremlin-cache',
+            f'--gremlin-mutant-timeout={_ROOMY_LIMIT}',
+            mutant_sleep=_MUTANT_SLEEP_WITHIN_A_ROOMY_LIMIT,
+        )
 
-        assert _verdicts(first.stdout.str())['Timeout'] > 0
-        assert _verdicts(second.stdout.str())['Zapped'] > 0
+        assert _verdicts(first.stdout.str())['Zapped'] == 2
         assert 'cache hit' not in second.stdout.str()
         assert third.stdout.str().count('cache hit (skipping)') == 2
 
@@ -229,7 +256,7 @@ class DescribeMutantTimeoutEndToEnd:
     def it_rejects_an_out_of_range_cli_value_naming_the_flag_and_value(
         self, pytester_with_markers: pytest.Pytester, value: str
     ) -> None:
-        pytester_with_markers.makepyfile(sample=_TARGET, test_sample=_SLOW_UNDER_A_MUTANT)
+        pytester_with_markers.makepyfile(sample=_TARGET, test_sample=_SLOW_UNDER_A_MUTANT.format(seconds=1))
 
         result = pytester_with_markers.runpytest('--gremlins', f'--gremlin-mutant-timeout={value}')
 
@@ -238,8 +265,55 @@ class DescribeMutantTimeoutEndToEnd:
     def it_rejects_a_non_integer_cli_value_naming_the_flag_and_value(
         self, pytester_with_markers: pytest.Pytester
     ) -> None:
-        pytester_with_markers.makepyfile(sample=_TARGET, test_sample=_SLOW_UNDER_A_MUTANT)
+        pytester_with_markers.makepyfile(sample=_TARGET, test_sample=_SLOW_UNDER_A_MUTANT.format(seconds=1))
 
         result = pytester_with_markers.runpytest('--gremlins', '--gremlin-mutant-timeout=soon')
 
         result.stderr.fnmatch_lines(["*--gremlin-mutant-timeout*invalid int value: 'soon'*"])
+
+
+@pytest.mark.large
+class DescribeMutantTimeoutEndToEndAcrossModes:
+    """The runs that pay the full limit per mutant: the pooled modes, the CLI value, and a flipped cached verdict."""
+
+    @pytest.mark.parametrize('mode', ['parallel', 'batch'])
+    def it_times_out_a_mutant_run_longer_than_the_toml_value(
+        self, pytester_with_markers: pytest.Pytester, mode: str
+    ) -> None:
+        pytester_with_markers.makepyprojecttoml(
+            f'[tool.pytest-gremlins]\nmutant_timeout = {_LIMIT_THE_MUTANT_EXCEEDS}\n'
+        )
+
+        verdicts = _verdicts(_run(pytester_with_markers, *_EXECUTION_MODES[mode]).stdout.str())
+
+        assert verdicts['Timeout'] > 0
+        assert verdicts['Zapped'] == 0
+
+    def it_times_out_a_mutant_run_longer_than_the_cli_value(self, pytester_with_markers: pytest.Pytester) -> None:
+        verdicts = _verdicts(
+            _run(pytester_with_markers, f'--gremlin-mutant-timeout={_LIMIT_THE_MUTANT_EXCEEDS}').stdout.str()
+        )
+
+        assert verdicts['Timeout'] > 0
+
+    def it_judges_a_cached_verdict_again_under_a_different_timeout(
+        self, pytester_with_markers: pytest.Pytester
+    ) -> None:
+        sleep = _LIMIT_THE_MUTANT_EXCEEDS + 2
+        first = _run(
+            pytester_with_markers,
+            '--gremlin-cache',
+            f'--gremlin-mutant-timeout={_LIMIT_THE_MUTANT_EXCEEDS}',
+            mutant_sleep=sleep,
+        )
+        second = _run(
+            pytester_with_markers, '--gremlin-cache', f'--gremlin-mutant-timeout={_ROOMY_LIMIT}', mutant_sleep=sleep
+        )
+        third = _run(
+            pytester_with_markers, '--gremlin-cache', f'--gremlin-mutant-timeout={_ROOMY_LIMIT}', mutant_sleep=sleep
+        )
+
+        assert _verdicts(first.stdout.str())['Timeout'] > 0
+        assert _verdicts(second.stdout.str())['Zapped'] > 0
+        assert 'cache hit' not in second.stdout.str()
+        assert third.stdout.str().count('cache hit (skipping)') == 2

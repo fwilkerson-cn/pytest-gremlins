@@ -84,11 +84,19 @@ class JsonReporter:
         Returns:
             Dictionary suitable for JSON serialization.
         """
-        return {
+        report: JsonReport = {
             'summary': self._build_summary(score),
             'files': self._build_file_breakdown(score),
             'results': [self._build_result(r) for r in score.results],
         }
+        timeout_warning = score.timeout_warning
+        if timeout_warning is not None:
+            report['timeout_warning'] = {
+                'downgraded': score.downgraded_timeouts,
+                'mutant_timeout': score.mutant_timeout,
+                'message': timeout_warning,
+            }
+        return report
 
     def _build_summary(self, score: MutationScore) -> JsonSummary:
         """Build the summary section.

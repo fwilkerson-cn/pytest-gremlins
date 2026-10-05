@@ -20,7 +20,10 @@ if TYPE_CHECKING:
 
     from pytest_gremlins.reporting.results import GremlinResult
 
-from pytest_gremlins.reporting.results import GremlinResultStatus
+from pytest_gremlins.reporting.results import (
+    TIMEOUT_NOT_CONFIRMED_PREFIX,
+    GremlinResultStatus,
+)
 
 
 @dataclass(frozen=True)
@@ -31,10 +34,13 @@ class MutationScore:
         total: Total number of gremlins tested.
         zapped: Number of gremlins caught by tests.
         survived: Number of gremlins that escaped tests.
-        timeout: Number of gremlins that caused test timeouts.
+        timeout: Number of gremlins that caused test timeouts (confirmed ones; a timeout whose unmutated
+            tests do not finish well inside the limit is counted under ``error``).
         error: Number of gremlins that caused errors.
         pardoned: Number of gremlins explicitly pardoned (excluded from scoring).
         results: The underlying list of results.
+        mutant_timeout: Per-gremlin timeout in seconds the run used, named in the timeout warning;
+            ``None`` when unknown.
     """
 
     total: int
@@ -44,13 +50,15 @@ class MutationScore:
     error: int
     pardoned: int
     results: tuple[GremlinResult, ...]
+    mutant_timeout: int | None = None
 
     @classmethod
-    def from_results(cls, results: Sequence[GremlinResult]) -> MutationScore:
+    def from_results(cls, results: Sequence[GremlinResult], mutant_timeout: int | None = None) -> MutationScore:
         """Create a MutationScore from a sequence of GremlinResults.
 
         Args:
             results: Sequence of GremlinResult objects to aggregate.
+            mutant_timeout: Per-gremlin timeout in seconds the run used, named in the timeout warning.
 
         Returns:
             MutationScore with counts for each status.
@@ -69,6 +77,37 @@ class MutationScore:
             error=error,
             pardoned=pardoned,
             results=tuple(results),
+            mutant_timeout=mutant_timeout,
+        )
+
+    @property
+    def downgraded_timeouts(self) -> int:
+        """Number of timeouts downgraded to errors: the unmutated tests did not finish well inside the limit."""
+        return sum(
+            1
+            for r in self.results
+            if r.status == GremlinResultStatus.ERROR and (r.error_output or '').startswith(TIMEOUT_NOT_CONFIRMED_PREFIX)
+        )
+
+    @property
+    def timeout_warning(self) -> str | None:
+        """Explain downgraded timeouts, or ``None`` when there were none.
+
+        Returns:
+            One line giving the count, the timeout, and the options that raise it.
+        """
+        downgraded_count = self.downgraded_timeouts
+        if not downgraded_count:
+            return None
+        timeout_label = f'{self.mutant_timeout}s timeout' if self.mutant_timeout is not None else 'mutant timeout'
+        if downgraded_count == 1:
+            subject = '1 timeout counted as an error, not a kill: without the mutant, its tests'
+        else:
+            subject = f'{downgraded_count} timeouts counted as errors, not kills: without the mutant, their tests'
+        return (
+            f'{subject} do not finish within half the {timeout_label}. '
+            'Raise the timeout with --gremlin-mutant-timeout or [tool.pytest-gremlins].mutant_timeout, '
+            'or speed up those tests.'
         )
 
     @property
@@ -76,7 +115,8 @@ class MutationScore:
         """Calculate mutation score as a percentage.
 
         The score is (zapped + timeout) / (total - pardoned) * 100.
-        Timeouts count as zapped because the test detected something wrong.
+        A timeout counts as zapped because the test detected something wrong, but only
+        a confirmed one: a timeout whose unmutated selection does not finish well inside the limit is an error.
         Pardoned gremlins are excluded from the denominator — they are
         intentionally suppressed and should not affect the score.
 
@@ -99,7 +139,8 @@ class MutationScore:
             results_by_file[result.gremlin.file_path].append(result)
 
         return {
-            file_path: MutationScore.from_results(file_results) for file_path, file_results in results_by_file.items()
+            file_path: MutationScore.from_results(file_results, mutant_timeout=self.mutant_timeout)
+            for file_path, file_results in results_by_file.items()
         }
 
     def top_survivors(self, limit: int = 10) -> list[GremlinResult]:
